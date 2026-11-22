@@ -61,6 +61,7 @@ model Patient {
   createdAt       DateTime      @default(now())
   appointments    Appointment[]
   queueTickets    QueueTicket[]
+  visits          Visit[]
 }
 
 // Kế hoạch hẹn — vòng đời FHIR R5 giản lược: booked → checked-in (ticket 02), các nhánh sau của ticket 05+.
@@ -105,6 +106,7 @@ model QueueTicket {
   @@unique([dateKey, number])
   @@index([dateKey, status])
   @@index([patientId])
+  visit Visit?
 }
 
 // Tham số vận hành — key-value đọc qua getConfigParam; màn chỉnh của admin vào ticket 12.
@@ -112,6 +114,60 @@ model Config {
   key       String   @id
   value     String
   updatedAt DateTime @updatedAt
+}
+
+// Phòng — mã bất biến, tên hiển thị đổi được (ticket 12). Khu thu ngân là một Phòng (kind CASHIER).
+model Room {
+  id             String   @id @default(cuid())
+  code           String   @unique
+  name           String
+  // CONSULT | ANCILLARY | CASHIER
+  kind           String
+  // free | reserved | occupied | cleaning | disabled | alert
+  state          String   @default("free")
+  disabledReason String?
+  reopenAt       DateTime?
+  capacity       Int      @default(1)
+  prefix         String?
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  visits         Visit[]
+  locations      VisitLocation[]
+}
+
+// Lượt khám (đối ứng Encounter) — planned → in-progress → ... (ticket 10 nút xong khám, ticket 11 cashier)
+model Visit {
+  id        String          @id @default(cuid())
+  ticketId  String          @unique
+  ticket    QueueTicket     @relation(fields: [ticketId], references: [id])
+  patientId String
+  patient   Patient         @relation(fields: [patientId], references: [id])
+  // planned | in-progress | on-hold | discharged | completed | cancelled | discontinued | entered-in-error | unknown
+  status    String          @default("planned")
+  roomId    String?
+  room      Room?           @relation(fields: [roomId], references: [id])
+  locations VisitLocation[]
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  @@index([roomId, status])
+  @@index([patientId])
+}
+
+// Encounter.location append-only: mỗi entry planned → active → completed; đổi nơi gói một transaction.
+model VisitLocation {
+  id        String   @id @default(cuid())
+  visitId   String
+  visit     Visit    @relation(fields: [visitId], references: [id], onDelete: Cascade)
+  roomId    String
+  room      Room     @relation(fields: [roomId], references: [id])
+  // planned | active | completed | reserved
+  status    String   @default("planned")
+  startedAt DateTime @default(now())
+  endedAt   DateTime?
+
+  @@index([visitId, status])
 }
 
 // Kho sự kiện append-only — timestamp server, chỉ ghi thêm. 7 nhóm theo spec.

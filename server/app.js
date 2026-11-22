@@ -101,6 +101,7 @@ export function createApp({ vite = null, distDir = null } = {}) {
       appointmentId: t.appointmentId,
       trackingCode: t.trackingCode,
       patient: t.patient ? publicPatient(t.patient) : null,
+      visit: t.visit ? { id: t.visit.id, status: t.visit.status, roomId: t.visit.roomId } : null,
     };
   }
 
@@ -248,7 +249,7 @@ export function createApp({ vite = null, distDir = null } = {}) {
     try {
       const tickets = await prisma.queueTicket.findMany({
         where: { dateKey: String(req.query.dateKey ?? dateKeyOf(new Date())) },
-        include: { patient: true },
+        include: { patient: true, visit: true },
         orderBy: { lastQueuedAt: 'asc' },
       });
       res.json({ tickets: tickets.map(publicTicket) });
@@ -450,6 +451,268 @@ export function createApp({ vite = null, distDir = null } = {}) {
         return count;
       });
       res.json({ moved });
+    } catch (err) { next(err); }
+  });
+
+  // ---- Ticket 05: Phòng + Lượt khám + gán phòng (điều phối manual) ----
+
+  function publicRoom(r) {
+    return {
+      id: r.id, code: r.code, name: r.name, kind: r.kind, state: r.state,
+      capacity: r.capacity, disabledReason: r.disabledReason, reopenAt: r.reopenAt, active: r.active,
+    };
+  }
+
+  function publicVisit(v) {
+    return { id: v.id, ticketId: v.ticketId, patientId: v.patientId, status: v.status, roomId: v.roomId };
+  }
+
+  // Phòng phải mở (active, không disabled/alert, chưa đầy) mới nhận xếp mới.
+  async function guardRoomAccepts(tx, room, excludeVisitId = null) {
+    if (!room.active) throw httpError(409, `Phòng ${room.name} đã ngừng hoạt động`);
+    if (room.state === 'disabled') throw httpError(409, `Phòng ${room.name} đang bị khóa: ${room.disabledReason ?? 'không rõ lý do'}`);
+    if (room.state === 'alert') throw httpError(409, `Phòng ${room.name} cần xử lý gấp, không xếp thêm`);
+    const activeVisits = await tx.visit.count({
+      where: { roomId: room.id, status: { in: ['planned', 'in-progress', 'on-hold'] }, ...(excludeVisitId ? { id: { not: excludeVisitId } } : {}) },
+    });
+    if (activeVisits >= room.capacity) throw httpError(409, `Phòng ${room.name} đã đầy (${activeVisits}/${room.capacity})`);
+  }
+
+  // Đổi trạng thái phòng bằng CAS trong transaction + ghi room.state.changed.
+  // Reload phòng sau updateMany để object trả về có state mới.
+  async function changeRoomState(tx, room, to, actor, extra = {}) {
+    const swapped = await tx.room.updateMany({ where: { id: room.id, state: room.state }, data: { state: to } });
+    if (swapped.count === 0) throw httpError(409, 'Phòng vừa bị thay đổi bởi một thao tác khác');
+    const fresh = await tx.room.findUnique({ where: { id: room.id } });
+    await recordEvent(tx, {
+      type: 'room.state.changed',
+      aggregateId: fresh.id,
+      payload: { roomId: fresh.id, from: room.state, to, ...extra },
+      actor,
+    });
+    return fresh;
+  }
+
+  // Xếp phòng: từ present là dẫn bệnh nhân vào ngay (occupied/in-progress/location active);
+  // từ waiting là xếp trước khi gọi (reserved/planned/location planned).
+  app.post('/api/tickets/:id/assign', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
+    const roomId = String(req.body?.roomId ?? '');
+    if (!roomId) return res.status(400).json({ error: 'Thiếu roomId' });
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        const ticket = await tx.queueTicket.findUnique({ where: { id: req.params.id }, include: { visit: true } });
+        if (!ticket) throw httpError(404, 'Không tìm thấy thẻ hàng đợi');
+        if (!['waiting', 'present'].includes(ticket.status)) {
+          throw httpError(409, `Thẻ đang ở trạng thái ${ticket.status}, không xếp phòng được`);
+        }
+        if (ticket.visit) throw httpError(409, 'Thẻ đã có lượt khám đang xếp');
+
+        const room = await tx.room.findUnique({ where: { id: roomId } });
+        if (!room) throw httpError(404, 'Không tìm thấy phòng');
+        await guardRoomAccepts(tx, room);
+
+        const entering = ticket.status === 'present';
+        const roomState = entering ? 'occupied' : 'reserved';
+        const visitStatus = entering ? 'in-progress' : 'planned';
+        const locationStatus = entering ? 'active' : 'planned';
+
+        const visit = await tx.visit.create({
+          data: { ticketId: ticket.id, patientId: ticket.patientId, status: visitStatus, roomId: room.id },
+        });
+        await tx.visitLocation.create({ data: { visitId: visit.id, roomId: room.id, status: locationStatus } });
+        // Inline CAS room state + reload ngay trong transaction.
+        const swapped = await tx.room.updateMany({ where: { id: room.id, state: room.state }, data: { state: roomState } });
+        if (swapped.count === 0) throw httpError(409, 'Phòng vừa bị thay đổi bởi một thao tác khác');
+        const freshRoom = await tx.room.findUnique({ where: { id: room.id } });
+        await recordEvent(tx, {
+          type: 'room.state.changed',
+          aggregateId: freshRoom.id,
+          payload: { roomId: freshRoom.id, from: room.state, to: roomState, ticketId: ticket.id },
+          actor,
+        });
+        await recordEvent(tx, {
+          type: 'assignment.created',
+          aggregateId: ticket.id,
+          payload: { ticketId: ticket.id, visitId: visit.id, roomId: freshRoom.id, roomState },
+          actor,
+        });
+        if (entering) {
+          await recordEvent(tx, {
+            type: 'patient.status.changed',
+            aggregateId: ticket.patientId,
+            payload: { subjectStatus: 'receiving-care', visitId: visit.id },
+            actor,
+          });
+        }
+        return { visit: { ...visit, room: freshRoom }, room: freshRoom };
+      });
+      res.json({ visit: publicVisit(result.visit), room: publicRoom(result.room) });
+    } catch (err) { next(err); }
+  });
+
+  // Bệnh nhân vào phòng thật: planned → in-progress, location planned → active, reserved → occupied.
+  app.post('/api/tickets/:id/admit', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        const ticket = await tx.queueTicket.findUnique({ where: { id: req.params.id }, include: { visit: true } });
+        if (!ticket) throw httpError(404, 'Không tìm thấy thẻ hàng đợi');
+        if (!ticket.visit) throw httpError(409, 'Thẻ chưa được xếp phòng');
+        if (ticket.visit.status !== 'planned') throw httpError(409, `Lượt khám đang ${ticket.visit.status}`);
+        const room = await tx.room.findUnique({ where: { id: ticket.visit.roomId } });
+        if (!room) throw httpError(404, 'Không tìm thấy phòng của lượt khám');
+
+        const visit = await tx.visit.update({ where: { id: ticket.visit.id }, data: { status: 'in-progress' } });
+        // Entry cũ completed, entry mới active (append-only).
+        await tx.visitLocation.updateMany({
+          where: { visitId: visit.id, status: 'planned' },
+          data: { status: 'completed', endedAt: new Date() },
+        });
+        await tx.visitLocation.create({ data: { visitId: visit.id, roomId: room.id, status: 'active' } });
+        // Inline CAS room state + reload.
+        const swapped = await tx.room.updateMany({ where: { id: room.id, state: room.state }, data: { state: 'occupied' } });
+        if (swapped.count === 0) throw httpError(409, 'Phòng vừa bị thay đổi bởi một thao tác khác');
+        const freshRoom = await tx.room.findUnique({ where: { id: room.id } });
+        await recordEvent(tx, {
+          type: 'room.state.changed',
+          aggregateId: freshRoom.id,
+          payload: { roomId: freshRoom.id, from: room.state, to: 'occupied', ticketId: ticket.id },
+          actor,
+        });
+        await recordEvent(tx, {
+          type: 'encounter.location.changed',
+          aggregateId: visit.id,
+          payload: { visitId: visit.id, roomId: freshRoom.id, from: 'planned', to: 'active' },
+          actor,
+        });
+        await recordEvent(tx, {
+          type: 'patient.status.changed',
+          aggregateId: ticket.patientId,
+          payload: { subjectStatus: 'receiving-care', visitId: visit.id },
+          actor,
+        });
+        return { visit: { ...visit, room: freshRoom }, room: freshRoom };
+      });
+      res.json({ visit: publicVisit(result.visit), room: publicRoom(result.room) });
+    } catch (err) { next(err); }
+  });
+
+  // Chuyển phòng: entry cũ completed + room cũ free, room mới nhận — gói một transaction,
+  // phát assignment.revoked + encounter.location.changed + assignment.created + room.state.changed.
+  app.post('/api/tickets/:id/reassign', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
+    const roomId = String(req.body?.roomId ?? '');
+    if (!roomId) return res.status(400).json({ error: 'Thiếu roomId' });
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        const ticket = await tx.queueTicket.findUnique({ where: { id: req.params.id }, include: { visit: true } });
+        if (!ticket) throw httpError(404, 'Không tìm thấy thẻ hàng đợi');
+        if (!ticket.visit) throw httpError(409, 'Thẻ chưa được xếp phòng');
+        const oldRoomId = ticket.visit.roomId;
+        if (oldRoomId === roomId) throw httpError(409, 'Thẻ đã ở phòng này');
+
+        const room = await tx.room.findUnique({ where: { id: roomId } });
+        if (!room) throw httpError(404, 'Không tìm thấy phòng');
+        await guardRoomAccepts(tx, room, ticket.visit.id);
+
+        const entering = ticket.visit.status === 'in-progress';
+        const roomState = entering ? 'occupied' : 'reserved';
+        const locationStatus = entering ? 'active' : 'planned';
+
+        const oldRoom = await tx.room.findUnique({ where: { id: oldRoomId } });
+        await tx.visitLocation.updateMany({
+          where: { visitId: ticket.visit.id, status: { in: ['planned', 'active'] } },
+          data: { status: 'completed', endedAt: new Date() },
+        });
+        // Inline CAS old room -> free.
+        const oldSwapped = await tx.room.updateMany({ where: { id: oldRoom.id, state: oldRoom.state }, data: { state: 'free' } });
+        if (oldSwapped.count === 0) throw httpError(409, 'Phòng cũ vừa bị thay đổi bởi một thao tác khác');
+        const freedRoom = await tx.room.findUnique({ where: { id: oldRoom.id } });
+        await recordEvent(tx, {
+          type: 'room.state.changed',
+          aggregateId: freedRoom.id,
+          payload: { roomId: freedRoom.id, from: oldRoom.state, to: 'free', ticketId: ticket.id },
+          actor,
+        });
+        await recordEvent(tx, {
+          type: 'assignment.revoked',
+          aggregateId: ticket.id,
+          payload: { ticketId: ticket.id, visitId: ticket.visit.id, roomId: freedRoom.id, reason: 'reassign' },
+          actor,
+        });
+
+        const visit = await tx.visit.update({ where: { id: ticket.visit.id }, data: { roomId: room.id } });
+        // Entry cũ completed, entry mới status theo roomState.
+        await tx.visitLocation.updateMany({
+          where: { visitId: ticket.visit.id, status: { in: ['planned', 'active'] } },
+          data: { status: 'completed', endedAt: new Date() },
+        });
+        await tx.visitLocation.create({ data: { visitId: visit.id, roomId: room.id, status: locationStatus } });
+        // Inline CAS new room state + reload.
+        const newSwapped = await tx.room.updateMany({ where: { id: room.id, state: room.state }, data: { state: roomState } });
+        if (newSwapped.count === 0) throw httpError(409, 'Phòng mới vừa bị thay đổi bởi một thao tác khác');
+        const freshRoom = await tx.room.findUnique({ where: { id: room.id } });
+        await recordEvent(tx, {
+          type: 'encounter.location.changed',
+          aggregateId: visit.id,
+          payload: { visitId: visit.id, fromRoomId: oldRoomId, toRoomId: room.id },
+          actor,
+        });
+        await recordEvent(tx, {
+          type: 'assignment.created',
+          aggregateId: ticket.id,
+          payload: { ticketId: ticket.id, visitId: visit.id, roomId: room.id, roomState },
+          actor,
+        });
+        // Inline CAS new room state + reload.
+        const newSwapped2 = await tx.room.updateMany({ where: { id: room.id, state: room.state }, data: { state: roomState } });
+        if (newSwapped2.count === 0) throw httpError(409, 'Phòng mới vừa bị thay đổi bởi một thao tác khác');
+        const freshRoom2 = await tx.room.findUnique({ where: { id: room.id } });
+        await recordEvent(tx, {
+          type: 'room.state.changed',
+          aggregateId: freshRoom2.id,
+          payload: { roomId: freshRoom2.id, from: room.state, to: roomState, ticketId: ticket.id },
+          actor,
+        });
+        return { visit: { ...visit, room: freshRoom2 }, room: freshRoom2 };
+        return { visit: { ...visit, room: freshRoom }, room: freshRoom };
+      });
+      res.json({ visit: publicVisit(result.visit), room: publicRoom(result.room) });
+    } catch (err) { next(err); }
+  });
+
+  // Danh sách phòng kèm tải (số lượt đang chiếm).
+  app.get('/api/rooms', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    try {
+      const rooms = await prisma.room.findMany({ orderBy: { code: 'asc' } });
+      const loads = await prisma.visit.groupBy({
+        by: ['roomId'],
+        where: { status: { in: ['planned', 'in-progress', 'on-hold'] }, roomId: { not: null } },
+        _count: { _all: true },
+      });
+      const loadByRoom = new Map(loads.map((l) => [l.roomId, l._count._all]));
+      res.json({ rooms: rooms.map((r) => ({ ...publicRoom(r), load: loadByRoom.get(r.id) ?? 0 })) });
+    } catch (err) { next(err); }
+  });
+
+  // Gợi ý xếp phòng: phòng mở ít tải nhất trước — lễ tân giữ quyền override tay.
+  app.get('/api/rooms/suggest', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    try {
+      const rooms = await prisma.room.findMany({
+        where: { active: true, state: { in: ['free', 'reserved'] } },
+        orderBy: { code: 'asc' },
+      });
+      const loads = await prisma.visit.groupBy({
+        by: ['roomId'],
+        where: { status: { in: ['planned', 'in-progress', 'on-hold'] }, roomId: { not: null } },
+        _count: { _all: true },
+      });
+      const loadByRoom = new Map(loads.map((l) => [l.roomId, l._count._all]));
+      const suggestions = rooms
+        .filter((r) => (loadByRoom.get(r.id) ?? 0) < r.capacity)
+        .sort((a, b) => (loadByRoom.get(a.id) ?? 0) - (loadByRoom.get(b.id) ?? 0) || a.code.localeCompare(b.code));
+      res.json({ rooms: suggestions.map((r) => ({ ...publicRoom(r), load: loadByRoom.get(r.id) ?? 0 })) });
     } catch (err) { next(err); }
   });
 

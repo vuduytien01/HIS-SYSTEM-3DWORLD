@@ -8,6 +8,15 @@ const DEMO_STAFF = [
   { username: 'admin', role: 'ADMIN', displayName: 'Admin demo' },
 ];
 
+// Phòng demo — mã bất biến, khu thu ngân là một phòng (ticket 05).
+const DEMO_ROOMS = [
+  { code: 'P01', name: 'Phòng khám 1', kind: 'CONSULT' },
+  { code: 'P02', name: 'Phòng khám 2', kind: 'CONSULT' },
+  { code: 'P03', name: 'Phòng khám 3', kind: 'CONSULT' },
+  { code: 'XQ', name: 'X-quang', kind: 'ANCILLARY' },
+  { code: 'TN', name: 'Khu thu ngân', kind: 'CASHIER' },
+];
+
 async function main() {
   const password = process.env.DEMO_PASSWORD;
   if (!password) {
@@ -23,7 +32,14 @@ async function main() {
       create: { username: s.username, passwordHash: hash, role: s.role, displayName: s.displayName },
     });
   }
-  console.log('[seed] xong: 3 vai demo, mật khẩu từ DEMO_PASSWORD.');
+  for (const r of DEMO_ROOMS) {
+    await prisma.room.upsert({
+      where: { code: r.code },
+      update: { name: r.name, kind: r.kind },
+      create: { ...r, capacity: 1 },
+    });
+  }
+  console.log('[seed] xong: 3 vai demo + 5 phòng demo, mật khẩu từ DEMO_PASSWORD.');
 }
 
 main().finally(() => prisma.$disconnect());

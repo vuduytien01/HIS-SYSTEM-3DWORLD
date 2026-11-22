@@ -2,6 +2,7 @@
 import {
   apiSearchPatients, apiCreatePatient, apiCheckInAppointment, apiWalkInCheckIn, apiAppointments, apiTickets,
   apiCallTicket, apiParkTicket, apiRecallTicket, apiPresentTicket, apiSkipTicket, apiRejoinTicket, apiSweep,
+  apiRooms, apiSuggestRooms, apiAssignTicket, apiAdmitTicket,
 } from '../api.js';
 import { ROLE_LABELS } from '../roles.js';
 import { GENDER_OPTIONS, genderOptionsHtml } from '../patient-fields.js';
@@ -64,7 +65,7 @@ export function renderReception(root, user) {
         </table>
         <h2>Thẻ hàng đợi hôm nay</h2>
         <table class="list">
-          <thead><tr><th>STT</th><th>Giờ cấp</th><th>Bệnh nhân</th><th>Trạng thái</th><th>Thao tác</th></tr></thead>
+          <thead><tr><th>STT</th><th>Giờ cấp</th><th>Bệnh nhân</th><th>Trạng thái</th><th>Thao tác</th><th>Phòng</th></tr></thead>
           <tbody id="ticket-tbody"></tbody>
         </table>
         <button id="sweep" class="primary">Sweep cuối phiên — skipped chuyển no-show</button>
@@ -77,6 +78,7 @@ export function renderReception(root, user) {
   let selected = null;
   let bookedAppointment = null;
   let appointmentsCache = [];
+  let roomsCache = [];
 
   function setMsg(text, isError = false) {
     const el = $('#flow-msg');
@@ -122,7 +124,8 @@ export function renderReception(root, user) {
     'no-show': [{ act: 'rejoin', label: 'Quay lại', api: apiRejoinTicket }],
   };
 
-  function renderTickets(list) {
+  function renderTickets(list, suggestions) {
+    const roomName = new Map(roomsCache.map((r) => [r.id, r.name]));
     $('#ticket-tbody').innerHTML = list.length
       ? list.map((t) => {
           const actions = (TICKET_ACTIONS[t.status] ?? [])
@@ -131,22 +134,42 @@ export function renderReception(root, user) {
           const badge = t.status === 'parked' && t.parkedUntil
             ? `<span class="park-badge" data-until="${esc(t.parkedUntil)}">giữ đến ${timeOf(t.parkedUntil)}</span>`
             : '';
+          // Cột phòng: có lượt khám → tên phòng + trạng thái; chưa → select gợi ý (đầu danh sách là phòng ít tải nhất) + nút xếp
+          let roomCell = '';
+          if (t.visit) {
+            const vLabel = t.visit.status === 'in-progress' ? 'đang khám' : (t.visit.status === 'planned' ? 'đã xếp' : t.visit.status);
+            roomCell = `<span class="room-tag">${esc(roomName.get(t.visit.roomId) ?? '?')} · ${vLabel}</span>`;
+            if (t.visit.status === 'planned' && t.status === 'present') {
+              roomCell += ` <button class="primary" data-action="admit" data-id="${esc(t.id)}">Vào phòng</button>`;
+            }
+          } else if (t.status === 'waiting' || t.status === 'present') {
+            const options = suggestions.map((r, i) =>
+              `<option value="${esc(r.id)}">${esc(r.name)} (${r.load}/${r.capacity})${i === 0 ? ' — gợi ý' : ''}</option>`).join('');
+            roomCell = suggestions.length
+              ? `<select class="room-select" data-assign="${esc(t.id)}">${options}</select>
+                 <button class="primary" data-assign-go="${esc(t.id)}">Xếp</button>`
+              : '<span class="muted">Không còn phòng trống</span>';
+          }
           return `<tr>
             <td>${t.number}</td>
             <td>${timeOf(t.issuedAt)}</td>
             <td>${esc(t.patient?.fullName ?? '')}</td>
             <td>${esc(QUEUE_STATUS_LABELS[t.status] ?? t.status)} ${badge}</td>
             <td>${actions}</td>
+            <td>${roomCell}</td>
           </tr>`;
         }).join('')
-      : '<tr><td colspan="5" class="muted">Chưa có số nào trong ngày.</td></tr>';
+      : '<tr><td colspan="6" class="muted">Chưa có số nào trong ngày.</td></tr>';
   }
 
   async function refreshLists() {
-    const [{ appointments }, { tickets }] = await Promise.all([apiAppointments(), apiTickets()]);
+    const [{ appointments }, { tickets }, { rooms }, { rooms: suggestions }] = await Promise.all([
+      apiAppointments(), apiTickets(), apiRooms(), apiSuggestRooms(),
+    ]);
     appointmentsCache = appointments;
+    roomsCache = rooms;
     renderAppointments(appointments);
-    renderTickets(tickets);
+    renderTickets(tickets, suggestions);
   }
 
   function clearSelection() {
@@ -215,12 +238,26 @@ export function renderReception(root, user) {
 
   // Nút một cú bấm từ bảng: server là thẩm quyền, client chỉ chuyển tiếp.
   $('#ticket-tbody').addEventListener('click', async (e) => {
+    const assignBtn = e.target.closest('button[data-assign-go]');
+    if (assignBtn) {
+      const select = root.querySelector(`select[data-assign="${assignBtn.dataset.assignGo}"]`);
+      if (!select?.value) return;
+      try {
+        const res = await apiAssignTicket(assignBtn.dataset.assignGo, select.value);
+        toast(`Đã xếp vào ${res.room.name}`);
+        await refreshLists();
+      } catch (err) {
+        setMsg(err.message, true);
+      }
+      return;
+    }
     const btn = e.target.closest('button[data-action]');
     if (!btn) return;
-    const row = Object.values(TICKET_ACTIONS).flat().find((a) => a.act === btn.dataset.action);
     try {
-      const res = await row.api(btn.dataset.id);
-      toast(`Số ${res.number}: ${QUEUE_STATUS_LABELS[res.status] ?? 'đã xử lý'}`);
+      const res = btn.dataset.action === 'admit'
+        ? await apiAdmitTicket(btn.dataset.id)
+        : await Object.values(TICKET_ACTIONS).flat().find((a) => a.act === btn.dataset.action).api(btn.dataset.id);
+      toast(`Số ${res.number}: ${QUEUE_STATUS_LABELS[res.status] ?? res.room?.name ?? 'đã xử lý'}`);
       await refreshLists();
     } catch (err) {
       setMsg(err.message, true);

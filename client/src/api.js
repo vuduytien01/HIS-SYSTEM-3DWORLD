@@ -51,6 +51,15 @@ export const apiSweep = () => fetchJson('/api/sweep', { method: 'POST' });
 export const apiPublicConfirmPresence = (code) =>
   fetchJson(`/api/public/track/${encodeURIComponent(code)}/confirm`, { method: 'POST' });
 
+// ---- Ticket 05: phòng + lượt khám + gán phòng ----
+export const apiRooms = () => fetchJson('/api/rooms');
+export const apiSuggestRooms = () => fetchJson('/api/rooms/suggest');
+export const apiAssignTicket = (id, roomId) =>
+  fetchJson(`/api/tickets/${encodeURIComponent(id)}/assign`, { method: 'POST', body: JSON.stringify({ roomId }) });
+export const apiAdmitTicket = (id) => fetchJson(`/api/tickets/${encodeURIComponent(id)}/admit`, { method: 'POST' });
+export const apiReassignTicket = (id, roomId) =>
+  fetchJson(`/api/tickets/${encodeURIComponent(id)}/reassign`, { method: 'POST', body: JSON.stringify({ roomId }) });
+
 export function connectSocket(options = {}) {
   return io({ withCredentials: true, ...options });
 }

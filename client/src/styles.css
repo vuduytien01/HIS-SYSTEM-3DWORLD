@@ -87,3 +87,5 @@ button.primary:disabled { opacity: .6; cursor: default; }
 #presence-ask { margin-top: 8px; padding: 10px; border: 1px dashed #93b1d4; border-radius: 8px; }
 .park-badge { display: inline-block; margin-left: 6px; padding: 2px 8px; font-size: 12px; background: #fff3cd; color: #7a5b00; border-radius: 999px; }
 #sweep { margin-top: 14px; }
+.room-select { padding: 4px 6px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; max-width: 220px; }
+.room-tag { font-size: 13px; color: #0f3d6e; font-weight: 600; }
