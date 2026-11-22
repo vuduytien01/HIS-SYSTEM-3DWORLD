@@ -972,6 +972,99 @@ export function createApp({ vite = null, distDir = null } = {}) {
     } catch (err) { next(err); }
   });
 
+  // ---- Ticket 09: Kéo thả trên 3D World — drag là đề xuất, server là thẩm quyền ----
+
+  // Kéo thả xếp phòng: client gửi drag-drop, server là thẩm quyền, trả accept/reject.
+  app.post('/api/tickets/:id/drag-drop', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
+    const { roomId, callNow = false, transactionId } = req.body ?? {};
+    if (!roomId) return res.status(400).json({ error: 'Thiếu roomId' });
+    const now = new Date();
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        const ticket = await tx.queueTicket.findUnique({ where: { id: req.params.id }, include: { visit: true } });
+        if (!ticket) throw httpError(404, 'Không tìm thấy thẻ hàng đợi');
+        if (ticket.status !== 'waiting') throw httpError(409, `Thẻ đang ở trạng thái ${ticket.status}, không kéo thả được`);
+
+        const room = await tx.room.findUnique({ where: { id: roomId } });
+        if (!room) throw httpError(404, 'Không tìm thấy phòng');
+        await guardRoomAccepts(tx, room);
+
+        const entering = ticket.status === 'present'; // Drag-drop chỉ từ waiting (theo thiết kế)
+        const roomState = entering ? 'occupied' : 'reserved';
+        const visitStatus = entering ? 'in-progress' : 'planned';
+        const locationStatus = entering ? 'active' : 'planned';
+
+        // Tạo visit nếu chưa có
+        let visit = ticket.visit;
+        if (!visit) {
+          visit = await tx.visit.create({
+            data: { ticketId: ticket.id, patientId: ticket.patientId, status: visitStatus, roomId: room.id },
+          });
+          await tx.visitLocation.create({ data: { visitId: visit.id, roomId: room.id, status: entering ? 'active' : 'planned' } });
+        } else {
+          // Có visit rồi: update room + location mới
+          await tx.visit.update({ where: { id: visit.id }, data: { roomId: room.id, status: visitStatus } });
+          await tx.visitLocation.create({ data: { visitId: visit.id, roomId: room.id, status: entering ? 'active' : 'planned' } });
+        }
+
+        // CAS room state
+        const swapped = await tx.room.updateMany({ where: { id: room.id, state: room.state }, data: { state: roomState } });
+        if (swapped.count === 0) throw httpError(409, 'Phòng vừa bị thay đổi bởi một thao tác khác');
+        const freshRoom = await tx.room.findUnique({ where: { id: room.id } });
+
+        // Events
+        await recordEvent(tx, {
+          type: 'assignment.created',
+          aggregateId: ticket.id,
+          payload: { ticketId: ticket.id, visitId: visit.id, roomId: freshRoom.id, roomState, transactionId: transactionId ?? null },
+          actor,
+        });
+        await recordEvent(tx, {
+          type: 'encounter.location.changed',
+          aggregateId: visit.id,
+          payload: { visitId: visit.id, roomId: freshRoom.id, status: locationStatus, transactionId: transactionId ?? null },
+          actor,
+        });
+        await recordEvent(tx, {
+          type: 'room.state.changed',
+          aggregateId: freshRoom.id,
+          payload: { roomId: freshRoom.id, from: room.state, to: roomState, ticketId: ticket.id, transactionId: transactionId ?? null },
+          actor,
+        });
+        if (entering) {
+          await recordEvent(tx, {
+            type: 'patient.status.changed',
+            aggregateId: ticket.patientId,
+            payload: { subjectStatus: 'receiving-care', visitId: visit.id },
+            actor,
+          });
+        }
+        if (callNow) {
+          await tx.queueTicket.update({ where: { id: ticket.id }, data: { status: 'called', callAttempts: { increment: 1 } } });
+          await recordEvent(tx, {
+            type: 'queue.ticket.changed',
+            aggregateId: ticket.id,
+            payload: { ticketId: ticket.id, number: ticket.number, dateKey: ticket.dateKey, from: 'waiting', to: 'called', reason: 'call', transactionId: transactionId ?? null },
+            actor,
+          });
+        }
+
+        return { ticket: { ...ticket, status: entering ? 'present' : 'waiting' }, room: freshRoom, visit: { ...visit, room: freshRoom }, transactionId: transactionId ?? null };
+      });
+      res.json({ accept: true, ...result });
+    } catch (err) {
+      // Trả reject với thông tin để client xử lý
+      const room = await prisma.room.findUnique({ where: { id: roomId } });
+      res.json({
+        accept: false,
+        error: err.message,
+        suggestedRoomId: (await prisma.room.findFirst({ where: { active: true, state: { in: ['free', 'reserved'] } }, orderBy: { code: 'asc' } }))?.id ?? null,
+        originalPosition: req.body?.originalPosition ?? null,
+      });
+    }
+  });
+
   // Lỗi nghiệp vụ mang status (httpError) — trả JSON thay vì trang HTML 500 mặc định của Express.
   app.use((err, req, res, next) => {
     if (err.status) {

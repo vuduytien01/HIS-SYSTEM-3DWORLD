@@ -5,6 +5,7 @@ import {
   apiRooms, apiSuggestRooms, apiAssignTicket, apiAdmitTicket,
   apiUndoTicket, apiOverrideComplete, apiOverrideReasons,
   apiSetPriority, apiEmergencyLane, apiGroupAdmission,
+  apiDragDropAssign,
 } from '../api.js';
 import { HospitalWorld } from '../world/world.js';
 import { ROLE_LABELS } from '../roles.js';
@@ -542,4 +543,34 @@ export function renderReception(root, user) {
       // world.applySnapshot sẽ được gọi qua queue:snapshot
     }
   });
+
+  // Drag-drop callbacks cho 3D World
+  world.onDragReject = (payload) => {
+    const { ticketId, reason, suggestedRoomId, originalPosition } = payload;
+    // Hiển thị thông báo từ chối
+    toast(`Xếp phòng bị từ chối: ${reason}`);
+    // Nút gợi ý phòng kế tiếp
+    if (suggestedRoomId) {
+      const room = roomsCache.find((r) => r.id === suggestedRoomId);
+      if (room) {
+        setMsg(`Gợi ý: ${room.name} (${room.load}/${room.capacity})`, false);
+      }
+    }
+    // Agent đã được move về vị trí cũ bởi world.handleDragReject
+  };
+
+  world.onDragAccept = (payload) => {
+    const { ticketId, roomId, callNow, transactionId } = payload;
+    // Refresh lists để cập nhật UI
+    refreshLists();
+    if (callNow) {
+      toast(`Đã gọi số cho ticket mới`);
+    }
+  };
+
+  // Kéo thả từ 3D World - server là thẩm quyền
+  // world sẽ emit 'drag.request' khi user drop agent vào phòng
+  // Client gửi POST /api/tickets/:id/drag-drop, server trả accept/reject
+  // world sẽ lắng nghe drag.reject / drag.accept
+  console.log('3D World drag-drop ready');
 }

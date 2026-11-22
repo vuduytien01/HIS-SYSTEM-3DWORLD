@@ -75,6 +75,13 @@ export const apiEmergencyLane = (id) =>
 export const apiGroupAdmission = (patients) =>
   fetchJson('/api/group-admission', { method: 'POST', body: JSON.stringify({ patients }) });
 
+// ---- Ticket 09: Kéo thả 3D World ----
+export const apiDragDropAssign = (ticketId, roomId, callNow = false) =>
+  fetchJson(`/api/tickets/${encodeURIComponent(ticketId)}/drag-drop`, {
+    method: 'POST',
+    body: JSON.stringify({ roomId, callNow }),
+  });
+
 export function connectSocket(options = {}) {
   return io({ withCredentials: true, ...options });
 }

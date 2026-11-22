@@ -1,5 +1,5 @@
-// 3D World quan sát — vanilla Three.js (ticket 08).
-// Phòng, agent, navmesh, sự kiện realtime. UI tiếng Việt.
+// 3D World quan sát — vanilla Three.js (ticket 08, 09).
+// Phòng, agent, navmesh, sự kiện realtime, drag-drop. UI tiếng Việt.
 
 import * as THREE from 'three';
 import { BufferGeometryUtils } from 'three/addons/utils/BufferGeometryUtils.js';
@@ -183,6 +183,121 @@ export class HospitalWorld {
       this.controls.distance = Math.max(this.controls.minDistance, Math.min(this.controls.maxDistance, this.controls.distance + e.deltaY * 0.05));
       this.updateCamera();
     }, { passive: true });
+
+    // --- Drag-drop agents (ticket 09) ---
+    let draggedAgent = null;
+    let dragStartPos = null;
+    let dragStartTime = 0;
+
+    this.renderer.domElement.addEventListener('mousedown', (e) => {
+      const mouse = new THREE.Vector2();
+      const rect = this.renderer.domElement.getBoundingClientRect();
+      mouse.x = ((e.clientX - rect.left) / this.renderer.domElement.clientWidth) * 2 - 1;
+      mouse.y = -((e.clientY - rect.top) / this.renderer.domElement.clientHeight) * 2 + 1;
+
+      const raycaster = new THREE.Raycaster();
+      raycaster.setFromCamera(mouse, this.camera);
+
+      const agentMeshes = Array.from(this.agents.values()).map((a) => a.mesh);
+      const intersects = raycaster.intersectObjects(agentMeshes, true);
+      if (intersects.length > 0) {
+        draggedAgent = intersects[0].object;
+        for (const [id, agent] of this.agents) {
+          if (agent.mesh === draggedAgent || agent.mesh.children.includes(draggedAgent)) {
+            draggedAgent = agent;
+            break;
+          }
+        }
+        if (draggedAgent) {
+          dragStartPos = draggedAgent.mesh.position.clone();
+          dragStartTime = Date.now();
+          draggedAgent.mesh.material.emissive = new THREE.Color(0xffff00);
+          draggedAgent.mesh.material.emissiveIntensity = 0.5;
+        }
+      }
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (!draggedAgent) return;
+      const mouse = new THREE.Vector2();
+      const rect = this.renderer.domElement.getBoundingClientRect();
+      mouse.x = ((e.clientX - rect.left) / this.renderer.domElement.clientWidth) * 2 - 1;
+      mouse.y = -((e.clientY - rect.top) / this.renderer.domElement.clientHeight) * 2 + 1;
+
+      const raycaster = new THREE.Raycaster();
+      raycaster.setFromCamera(mouse, this.camera);
+      const ground = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+      const intersect = new THREE.Vector3();
+      if (raycaster.ray.intersectPlane(ground, intersect)) {
+        draggedAgent.mesh.position.x = intersect.x;
+        draggedAgent.mesh.position.z = intersect.z;
+        draggedAgent.mesh.position.y = AGENT_RADIUS;
+      }
+    });
+
+    window.addEventListener('mouseup', async (e) => {
+      if (!draggedAgent) return;
+      const duration = Date.now() - dragStartTime;
+      if (duration < 100) {
+        draggedAgent.mesh.material.emissive = new THREE.Color(0x000000);
+        draggedAgent.mesh.material.emissiveIntensity = 0;
+        draggedAgent = null;
+        return;
+      }
+
+      const mouse = new THREE.Vector2();
+      const rect = this.renderer.domElement.getBoundingClientRect();
+      mouse.x = ((e.clientX - rect.left) / this.renderer.domElement.clientWidth) * 2 - 1;
+      mouse.y = -((e.clientY - rect.top) / this.renderer.domElement.clientHeight) * 2 + 1;
+
+      const raycaster = new THREE.Raycaster();
+      raycaster.setFromCamera(mouse, this.camera);
+
+      const roomMeshes = Array.from(this.rooms.values()).map((r) => r.mesh);
+      const intersects = raycaster.intersectObjects(roomMeshes, true);
+      let targetRoom = null;
+      if (intersects.length > 0) {
+        const roomEntry = this.rooms.get(intersects[0].object.userData.room.id);
+        if (roomEntry) targetRoom = roomEntry.room;
+      }
+
+      const ticket = draggedAgent.ticket;
+      const originalPosition = ticket.mesh?.position?.clone() || draggedAgent.mesh.position.clone();
+
+      if (targetRoom) {
+        try {
+          const res = await apiDragDropAssign(ticket.id, targetRoom.id, false);
+          if (res.accept) {
+            console.log('Drag-drop accepted:', res);
+          } else {
+            this.socket.emit('drag.reject', {
+              ticketId: ticket.id,
+              reason: res.error,
+              suggestedRoomId: res.suggestedRoomId,
+              originalPosition: { x: originalPosition.x, y: originalPosition.y, z: originalPosition.z },
+            });
+          }
+        } catch (err) {
+          this.socket.emit('drag.reject', {
+            ticketId: ticket.id,
+            reason: err.message,
+            suggestedRoomId: null,
+            originalPosition: { x: originalPosition.x, y: originalPosition.y, z: originalPosition.z },
+          });
+        }
+      } else {
+        this.socket.emit('drag.reject', {
+          ticketId: ticket.id,
+          reason: 'Kéo thả ra khỏi khu vực phòng hợp lệ',
+          suggestedRoomId: null,
+          originalPosition: { x: originalPosition.x, y: originalPosition.y, z: originalPosition.z },
+        });
+      }
+
+      draggedAgent.mesh.material.emissive = new THREE.Color(0x000000);
+      draggedAgent.mesh.material.emissiveIntensity = 0;
+      draggedAgent = null;
+    });
   }
 
   updateCamera() {
@@ -330,6 +445,13 @@ export class HospitalWorld {
     this.socket.on('config.changed', () => {
       this.socket.emit('getConfig');
     });
+    // Drag-drop events
+    this.socket.on('drag.reject', (payload) => {
+      this.handleDragReject(payload);
+    });
+    this.socket.on('drag.accept', (payload) => {
+      this.handleDragAccept(payload);
+    });
   }
 
   applySnapshot(snap) {
@@ -358,6 +480,39 @@ export class HospitalWorld {
     if (agent) {
       this.pendingCalls.set(payload.number, true);
     }
+  }
+
+  // --- Drag-drop handling (ticket 09) ---
+  handleDragReject(payload) {
+    const { ticketId, reason, suggestedRoomId, originalPosition } = payload;
+    const agent = this.agents.get(ticketId);
+    if (!agent) return;
+    agent.mesh.material.emissive = new THREE.Color(0xff0000);
+    agent.mesh.material.emissiveIntensity = 0.8;
+    setTimeout(() => {
+      agent.mesh.material.emissive = new THREE.Color(0x000000);
+      agent.mesh.material.emissiveIntensity = 0;
+    }, 2000);
+    agent.mesh.position.copy(originalPosition);
+    agent.target = originalPosition.clone();
+    agent.path = [];
+    agent.moving = false;
+    this.onDragReject?.(payload);
+  }
+
+  handleDragAccept(payload) {
+    const { ticketId, roomId, callNow, transactionId } = payload;
+    const agent = this.agents.get(ticketId);
+    if (!agent) return;
+    const room = this.rooms.get(roomId);
+    if (room) {
+      const targetPos = new THREE.Vector3(room.room.x + room.room.width / 2, AGENT_RADIUS, room.room.z + room.room.depth / 2);
+      agent.target = targetPos;
+      agent.path = [targetPos.clone()];
+      agent.pathIndex = 0;
+      agent.moving = true;
+    }
+    this.onDragAccept?.(payload);
   }
 
   animate() {
