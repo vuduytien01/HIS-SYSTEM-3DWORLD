@@ -40,6 +40,12 @@ export async function resolveSession(token) {
   return session;
 }
 
+// Dùng chung cho Express middleware và Socket.io handshake.
+export async function resolveSessionFromCookieHeader(header) {
+  const cookies = parseCookies(header);
+  return resolveSession(cookies[config.sessionCookieName]);
+}
+
 export function parseCookies(header) {
   const out = {};
   if (!header) return out;

@@ -5,8 +5,8 @@ import path from 'node:path';
 import { config } from './config.js';
 import prisma from './db.js';
 import {
-  verifyPassword, createSession, resolveSession,
-  parseCookies, setSessionCookie, clearSessionCookie, publicUser,
+  verifyPassword, createSession, resolveSessionFromCookieHeader,
+  setSessionCookie, clearSessionCookie, publicUser,
 } from './auth.js';
 
 const CLIENT_DIR = path.resolve(process.cwd(), 'client');
@@ -17,19 +17,9 @@ export function createApp({ vite = null, distDir = null } = {}) {
 
   // Đính session từ cookie vào req
   app.use(async (req, res, next) => {
-    const cookies = parseCookies(req.headers.cookie);
-    const token = cookies[config.sessionCookieName];
-    req.session = await resolveSession(token);
+    req.session = await resolveSessionFromCookieHeader(req.headers.cookie);
     next();
   });
-
-  const requireRole = (...roles) => (req, res, next) => {
-    if (!req.session) return res.status(401).json({ error: 'Chưa đăng nhập' });
-    if (roles.length && !roles.includes(req.session.user.role)) {
-      return res.status(403).json({ error: 'Không đủ quyền' });
-    }
-    next();
-  };
 
   app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body || {};

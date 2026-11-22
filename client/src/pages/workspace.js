@@ -1,20 +1,61 @@
-// Màn hình làm việc rỗng theo vai (ticket 01) — nội dung nghiệp vụ vào các ticket sau.
+// Màn hình làm việc theo vai (ticket 01) — nội dung nghiệp vụ vào các ticket sau.
+// Ba vai có ba nhánh màn riêng; vai này không render màn vai khác.
 import { apiLogout, connectSocket } from '../api.js';
+import { ROLE_LABELS } from '../roles.js';
 
-const ROLE_LABELS = { RECEPTIONIST: 'Lễ tân', DOCTOR: 'Bác sĩ', ADMIN: 'Admin' };
-
-export function renderWorkspace(root, user) {
-  const label = ROLE_LABELS[user.role] || user.role;
+function receptionScreen(root, user) {
   root.innerHTML = `
     <header class="topbar">
       <span class="brand">Điều phối khám bệnh</span>
-      <span class="user">${user.displayName} · ${label}</span>
+      <span class="user">${user.displayName} · Lễ tân</span>
       <button id="logout">Đăng xuất</button>
     </header>
     <main class="workspace">
-      <p class="placeholder">Màn hình ${label} — nội dung nghiệp vụ sẽ vào ở các ticket sau.</p>
+      <p class="placeholder">Bảng điều phối — nội dung vào ticket 02-09.</p>
     </main>
   `;
+}
+
+function doctorScreen(root, user) {
+  root.innerHTML = `
+    <header class="topbar">
+      <span class="brand">Điều phối khám bệnh</span>
+      <span class="user">${user.displayName} · Bác sĩ</span>
+      <button id="logout">Đăng xuất</button>
+    </header>
+    <main class="workspace">
+      <p class="placeholder">Console bác sĩ — nội dung vào ticket 10.</p>
+    </main>
+  `;
+}
+
+function adminScreen(root, user) {
+  root.innerHTML = `
+    <header class="topbar">
+      <span class="brand">Điều phối khám bệnh</span>
+      <span class="user">${user.displayName} · Admin</span>
+      <button id="logout">Đăng xuất</button>
+    </header>
+    <main class="workspace">
+      <p class="placeholder">Màn cấu hình và giám sát — nội dung vào ticket 12-13.</p>
+    </main>
+  `;
+}
+
+const SCREENS = {
+  RECEPTIONIST: receptionScreen,
+  DOCTOR: doctorScreen,
+  ADMIN: adminScreen,
+};
+
+export function renderWorkspace(root, user) {
+  const screen = SCREENS[user.role];
+  if (!screen) {
+    root.innerHTML = `<p class="error">Vai không hợp lệ: ${user.role}</p>`;
+    return;
+  }
+  screen(root, user);
+
   root.querySelector('#logout').addEventListener('click', async () => {
     await apiLogout();
     location.href = '/';
@@ -22,7 +63,10 @@ export function renderWorkspace(root, user) {
 
   const socket = connectSocket();
   socket.on('hello', (msg) => {
-    root.querySelector('.placeholder').textContent =
-      `Realtime hoạt động (kết nối lúc ${new Date(msg.serverTime).toLocaleTimeString('vi-VN')}). Nội dung nghiệp vụ sẽ vào ở các ticket sau.`;
+    const p = root.querySelector('.placeholder');
+    if (p) {
+      p.textContent =
+        `Realtime hoạt động (kết nối lúc ${new Date(msg.serverTime).toLocaleTimeString('vi-VN')}). Nội dung nghiệp vụ sẽ vào ở các ticket sau.`;
+    }
   });
 }

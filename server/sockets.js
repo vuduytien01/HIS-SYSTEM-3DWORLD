@@ -1,15 +1,13 @@
 // Socket.io: handshake xác thực session từ cookie, phân phòng theo vai.
 import { Server } from 'socket.io';
-import { config } from './config.js';
-import { resolveSession, parseCookies, publicUser } from './auth.js';
+import { resolveSessionFromCookieHeader, publicUser } from './auth.js';
 
 export function createIo(httpServer) {
-  const io = new Server(httpServer, { cors: { origin: true, credentials: true } });
+  // Client cùng origin với server (Vite middleware cùng process) — không mở CORS
+  const io = new Server(httpServer);
 
   io.use(async (socket, next) => {
-    const cookies = parseCookies(socket.handshake.headers.cookie);
-    const token = cookies[config.sessionCookieName];
-    const session = await resolveSession(token);
+    const session = await resolveSessionFromCookieHeader(socket.handshake.headers.cookie);
     socket.data.user = session ? publicUser(session.user) : null;
     next();
   });

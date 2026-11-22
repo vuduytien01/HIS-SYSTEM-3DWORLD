@@ -1,10 +1,9 @@
 // Router client theo pathname + trạng thái đăng nhập.
 import { apiMe } from './api.js';
+import { ROLE_LABELS } from './roles.js';
 import { renderLogin } from './pages/login.js';
 import { renderWorkspace } from './pages/workspace.js';
 import { renderTv } from './pages/tv.js';
-
-const ROLE_LABELS = { RECEPTIONIST: 'Lễ tân', DOCTOR: 'Bác sĩ', ADMIN: 'Admin' };
 
 export async function boot() {
   const root = document.getElementById('app');
@@ -25,7 +24,5 @@ export async function boot() {
     renderLogin(root);
     return;
   }
-  renderWorkspace(root, user, ROLE_LABELS[user.role] || user.role);
+  renderWorkspace(root, user);
 }
-
-boot();

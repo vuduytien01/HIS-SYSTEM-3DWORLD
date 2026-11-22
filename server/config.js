@@ -1,5 +1,5 @@
 // Cấu hình server từ biến môi trường — không credential literal trong code.
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
@@ -14,21 +14,11 @@ if (existsSync(envPath)) {
   }
 }
 
-let sessionSecret = process.env.SESSION_SECRET;
-const sessionSecretSource = sessionSecret ? 'env' : 'random-dev-fallback';
-if (!sessionSecret) {
-  sessionSecret = randomBytes(32).toString('hex');
-  console.warn('[config] SESSION_SECRET thiếu — dùng secret ngẫu nhiên cho dev.');
-}
-
 export const config = {
   port: Number(process.env.PORT || 3000),
   cookieSecure: process.env.COOKIE_SECURE === 'true',
   sessionTtlMs: 7 * 24 * 60 * 60 * 1000,
   sessionCookieName: 'sid',
-  sessionSecret,
-  sessionSecretSource,
-  demoPassword: process.env.DEMO_PASSWORD || null,
 };
 
 export const sha256 = (v) => createHash('sha256').update(v).digest('hex');
