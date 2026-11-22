@@ -25,7 +25,9 @@ db.exec(`
   );
 `);
 type StoredVisit = Visit & { claimCode: string | null };
-const byBooking = db.query<StoredVisit, [string]>("SELECT * FROM visits WHERE uid = ?");
+const byBooking = db.query<StoredVisit, [string, string]>(
+  "SELECT * FROM visits WHERE uid = ? AND day = ?"
+);
 const byToken = db.query<Visit, [string, string]>(
   "SELECT uid, start, number, marker, seenAt FROM visits WHERE token = ? AND day = ?"
 );
@@ -37,7 +39,7 @@ const checkIn = db.transaction((appointment: Appointment) => {
     ON CONFLICT(uid) DO NOTHING`,
     [appointment.uid, day, appointment.start, randomUUID(), randomUUID(), day]
   );
-  return byBooking.get(appointment.uid);
+  return byBooking.get(appointment.uid, day);
 });
 
 async function appointments(): Promise<Appointment[]> {
@@ -129,7 +131,7 @@ const server = Bun.serve({
           return json(
             (await appointments()).map((item) => ({
               ...item,
-              number: byBooking.get(item.uid)?.number ?? null,
+              number: byBooking.get(item.uid, today())?.number ?? null,
             }))
           );
         }
