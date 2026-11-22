@@ -35,6 +35,11 @@ export const apiWalkInCheckIn = (patientId) =>
 export const apiAppointments = (dateKey = '') => fetchJson(`/api/appointments${dateKey ? `?dateKey=${dateKey}` : ''}`);
 export const apiTickets = (dateKey = '') => fetchJson(`/api/tickets${dateKey ? `?dateKey=${dateKey}` : ''}`);
 
-export function connectSocket() {
-  return io({ withCredentials: true });
+// ---- Ticket 03: gọi số + mặt công cộng zero-PII ----
+export const apiCallTicket = (id) => fetchJson(`/api/tickets/${encodeURIComponent(id)}/call`, { method: 'POST' });
+export const apiPublicTv = () => fetchJson('/api/public/tv');
+export const apiPublicTrack = (code) => fetchJson(`/api/public/track/${encodeURIComponent(code)}`);
+
+export function connectSocket(options = {}) {
+  return io({ withCredentials: true, ...options });
 }

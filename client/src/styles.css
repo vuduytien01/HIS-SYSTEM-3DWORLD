@@ -56,6 +56,7 @@ body {
 .new-patient form { display: grid; gap: 8px; margin-top: 10px; }
 .new-patient input, .new-patient select { padding: 8px; border: 1px solid #d1d5db; border-radius: 6px; }
 button.primary { padding: 9px 14px; border: 0; border-radius: 6px; background: #0f3d6e; color: #fff; font-size: 14px; cursor: pointer; }
+.list button.primary { padding: 4px 10px; font-size: 13px; }
 button.primary:disabled { opacity: .6; cursor: default; }
 .list { width: 100%; border-collapse: collapse; font-size: 14px; }
 .list th, .list td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eef0f2; }
@@ -68,3 +69,17 @@ button.primary:disabled { opacity: .6; cursor: default; }
 .book-card input, .book-card select { width: 100%; padding: 8px; margin-top: 4px; border: 1px solid #d1d5db; border-radius: 6px; }
 .book-card button { width: 100%; padding: 10px; border: 0; border-radius: 6px; background: #0f3d6e; color: #fff; font-size: 15px; }
 .ok-line { color: #166534; font-size: 13px; }
+
+/* ---- Ticket 03: màn TV công cộng + trang theo dõi ---- */
+#tv-called, #tv-next { list-style: none; padding: 0; margin: 0; }
+.tv .tv-called h1 { font-size: 28px; color: #0f3d6e; }
+.tv-called-item { margin: 18px 0; }
+.tv-number { font-size: 64px; font-weight: 800; color: #0f3d6e; }
+.tv-action { font-size: 22px; }
+.tv-number-sm { font-size: 22px; font-weight: 700; color: #0f3d6e; }
+.tv-muted { color: #6b7280; }
+.tv-next { margin-top: 32px; }
+.tv-next h2 { font-size: 18px; color: #374151; }
+.tv-next li { margin: 8px 0; font-size: 16px; }
+.track-number { font-size: 40px; font-weight: 800; color: #0f3d6e; margin: 8px 0; }
+.track-status { font-size: 18px; font-weight: 600; }

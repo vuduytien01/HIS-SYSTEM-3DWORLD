@@ -12,6 +12,7 @@ import { requireRole } from './rbac.js';
 import { recordEvent } from './events.js';
 import { dateKeyOf, dayBounds, issueQueueTicket, retryOnTicketRace } from './queue.js';
 import { parsePatientInput, findOrCreatePatient, publicPatient, foldName } from './patients.js';
+import { tvAction, publicTicketView, tvSnapshot, trackSnapshot } from './queue-projection.js';
 
 const CLIENT_DIR = path.resolve(process.cwd(), 'client');
 
@@ -78,6 +79,7 @@ export function createApp({ vite = null, distDir = null } = {}) {
       status: t.status,
       issuedAt: t.issuedAt,
       appointmentId: t.appointmentId,
+      trackingCode: t.trackingCode,
       patient: t.patient ? publicPatient(t.patient) : null,
     };
   }
@@ -233,6 +235,57 @@ export function createApp({ vite = null, distDir = null } = {}) {
     } catch (err) { next(err); }
   });
 
+  // ---- Ticket 03: gọi số ba kênh + mặt công cộng zero-PII ----
+
+  // Một lần phát, ba room: TV công cộng, web bệnh nhân (mã theo dõi), loa quầy lễ tân (điểm neo TTS sau).
+  function broadcastCall(io, ticket) {
+    if (!io) return;
+    io.to('public').to(`track:${ticket.trackingCode}`).to('role:RECEPTIONIST')
+      .emit('call.issued', publicTicketView(ticket));
+  }
+
+  // Gọi số: waiting → called, ghi sự kiện trong transaction rồi phát ba kênh một lần.
+  app.post('/api/tickets/:id/call', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    const actor = req.session.user;
+    try {
+      const ticket = await prisma.$transaction(async (tx) => {
+        const current = await tx.queueTicket.findUnique({ where: { id: req.params.id } });
+        if (!current) throw httpError(404, 'Không tìm thấy thẻ hàng đợi');
+        if (current.status !== 'waiting') throw httpError(409, `Thẻ đang ở trạng thái ${current.status}, không gọi được`);
+        const updated = await tx.queueTicket.update({ where: { id: current.id }, data: { status: 'called' } });
+        await recordEvent(tx, {
+          type: 'queue.ticket.changed',
+          aggregateId: current.id,
+          payload: { ticketId: current.id, number: current.number, dateKey: current.dateKey, from: 'waiting', to: 'called', reason: 'call' },
+          actor: { type: 'user', id: actor.id, label: actor.displayName },
+        });
+        return updated;
+      });
+      broadcastCall(req.app.get('io'), ticket);
+      res.json(publicTicketView(ticket));
+    } catch (err) { next(err); }
+  });
+
+  // Mặt TV công cộng: lượt đang gọi + kế tiếp, zero-PII.
+  app.get('/api/public/tv', async (req, res, next) => {
+    try {
+      const tickets = await prisma.queueTicket.findMany({
+        where: { dateKey: String(req.query.dateKey ?? dateKeyOf(new Date())) },
+        orderBy: { number: 'asc' },
+      });
+      res.json(tvSnapshot(tickets));
+    } catch (err) { next(err); }
+  });
+
+  // Kênh web bệnh nhân: trạng thái của thẻ khớp mã theo dõi, zero-PII.
+  app.get('/api/public/track/:code', async (req, res, next) => {
+    try {
+      const ticket = await prisma.queueTicket.findUnique({ where: { trackingCode: String(req.params.code) } });
+      if (!ticket) return res.status(404).json({ error: 'Mã theo dõi không đúng' });
+      res.json(trackSnapshot(ticket));
+    } catch (err) { next(err); }
+  });
+
   // Lỗi nghiệp vụ mang status (httpError) — trả JSON thay vì trang HTML 500 mặc định của Express.
   app.use((err, req, res, next) => {
     if (err.status) {
@@ -259,6 +312,7 @@ export function createApp({ vite = null, distDir = null } = {}) {
   app.get('/', sendIndex);
   app.get('/tv', sendIndex);
   app.get('/book', sendIndex);
+  app.get('/track', sendIndex);
 
   return app;
 }

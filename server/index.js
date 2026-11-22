@@ -23,7 +23,7 @@ async function main() {
 
   const app = createApp(appOptions);
   const server = http.createServer(app);
-  createIo(server);
+  app.set('io', createIo(server));
 
   server.listen(config.port, () => {
     console.log(`[server] chạy ở http://localhost:${config.port} (${isDev ? 'dev: Vite middleware' : 'prod: static dist'})`);

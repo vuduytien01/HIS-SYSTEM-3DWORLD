@@ -5,6 +5,7 @@ import { renderLogin } from './pages/login.js';
 import { renderWorkspace } from './pages/workspace.js';
 import { renderTv } from './pages/tv.js';
 import { renderBook } from './pages/book.js';
+import { renderTrack } from './pages/track.js';
 
 export async function boot() {
   const root = document.getElementById('app');
@@ -16,6 +17,11 @@ export async function boot() {
 
   if (location.pathname === '/book') {
     renderBook(root);
+    return;
+  }
+
+  if (location.pathname === '/track') {
+    renderTrack(root);
     return;
   }
 

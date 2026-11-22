@@ -1,4 +1,6 @@
 // Domain thẻ hàng đợi: STT cấp theo ngày, reset mỗi sáng qua dateKey giờ server.
+import { randomBytes } from 'node:crypto';
+
 export function dateKeyOf(date) {
   const pad = (n) => String(n).padStart(2, '0');
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
@@ -25,6 +27,8 @@ export async function issueQueueTicket(tx, { patientId, appointmentId, dateKey }
       dateKey,
       number: (last?.number ?? 0) + 1,
       status: 'waiting',
+      // 8 ký tự hex in trên phiếu STT — bệnh nhân theo dõi kênh web bằng mã, không cần tài khoản
+      trackingCode: randomBytes(4).toString('hex'),
     },
   });
 }

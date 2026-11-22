@@ -61,7 +61,7 @@ export function renderReception(root, user) {
         </table>
         <h2>Thẻ hàng đợi hôm nay</h2>
         <table class="list">
-          <thead><tr><th>STT</th><th>Giờ cấp</th><th>Bệnh nhân</th><th>Trạng thái</th></tr></thead>
+          <thead><tr><th>STT</th><th>Giờ cấp</th><th>Bệnh nhân</th><th>Trạng thái</th><th>Thao tác</th></tr></thead>
           <tbody id="ticket-tbody"></tbody>
         </table>
       </section>
@@ -107,8 +107,9 @@ export function renderReception(root, user) {
           <td>${timeOf(t.issuedAt)}</td>
           <td>${esc(t.patient?.fullName ?? '')}</td>
           <td>${esc(QUEUE_STATUS_LABELS[t.status] ?? t.status)}</td>
+          <td>${t.status === 'waiting' ? `<button class="primary" data-call="${esc(t.id)}">Gọi</button>` : ''}</td>
         </tr>`).join('')
-      : '<tr><td colspan="4" class="muted">Chưa có số nào trong ngày.</td></tr>';
+      : '<tr><td colspan="5" class="muted">Chưa có số nào trong ngày.</td></tr>';
   }
 
   async function refreshLists() {
@@ -179,6 +180,19 @@ export function renderReception(root, user) {
       setMsg(err.message, true);
     } finally {
       btn.disabled = false;
+    }
+  });
+
+  // Gọi số từ bảng: một cú bấm → server phát 'call.issued' cho cả ba kênh.
+  $('#ticket-tbody').addEventListener('click', async (e) => {
+    const btn = e.target.closest('button[data-call]');
+    if (!btn) return;
+    try {
+      const ticket = await apiCallTicket(btn.dataset.call);
+      toast(`Đã gọi số ${ticket.number}`);
+      await refreshLists();
+    } catch (err) {
+      setMsg(err.message, true);
     }
   });
 
