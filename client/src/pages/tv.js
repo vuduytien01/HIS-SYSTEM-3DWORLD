@@ -24,15 +24,19 @@ export function renderTv(root) {
   const $ = (sel) => root.querySelector(sel);
   let state = { called: [], next: [] };
 
+  // Màn TV giữ tối đa 3 lượt gọi gần nhất — hạn mức đặt ở render để REST snapshot và đường realtime cùng một mặt.
+  const CALLED_LIMIT = 3;
+
   function render() {
-    $('#tv-called').innerHTML = state.called.length
-      ? state.called.map((t) => `<li class="tv-called-item">
+    const shown = state.called.slice(0, CALLED_LIMIT);
+    $('#tv-called').innerHTML = shown.length
+      ? shown.map((t) => `<li class="tv-called-item">
           <span class="tv-number">${t.number}</span>
-          <span class="tv-action">${esc(t.action)}${t.priority ? ' · Ưu tiên: có' : ''}</span>
+          <span class="tv-action">${esc(t.action)}</span>
         </li>`).join('')
       : '';
-    $('#tv-called-empty').hidden = state.called.length > 0;
-    $('#tv-now').textContent = state.called.length ? 'Mời số' : 'Đang chờ gọi';
+    $('#tv-called-empty').hidden = shown.length > 0;
+    $('#tv-now').textContent = shown.length ? 'Mời số' : 'Đang chờ gọi';
     $('#tv-next').innerHTML = state.next.length
       ? state.next.map((t) => `<li><span class="tv-number-sm">${t.number}</span> <span class="tv-muted">${esc(t.action)}</span></li>`).join('')
       : '<li class="tv-muted">Chưa có lượt chờ nào.</li>';
@@ -52,7 +56,7 @@ export function renderTv(root) {
   // Gọi số realtime: đưa số vào danh sách gọi, bỏ khỏi hàng chờ — cùng payload với TV và loa.
   socket.on('call.issued', (p) => {
     state = {
-      called: [p, ...state.called.filter((t) => t.number !== p.number)].slice(0, 3),
+      called: [p, ...state.called.filter((t) => t.number !== p.number)],
       next: state.next.filter((t) => t.number !== p.number),
     };
     render();

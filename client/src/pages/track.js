@@ -52,8 +52,9 @@ export function renderTrack(root) {
         socket = connectSocket({ auth: { trackingCode: code } });
         socket.on('queue:snapshot', render);
         // Sự kiện gọi phát từ server cũng tới room của mã — cập nhật tức thời.
+        // Lọc theo cả dateKey: cùng số khác ngày là thẻ khác (STT reset mỗi sáng).
         socket.on('call.issued', (p) => {
-          if (current && p.number === current.number) {
+          if (current && p.number === current.number && p.dateKey === current.dateKey) {
             render({ ...current, status: 'called', action: p.action });
           }
         });

@@ -277,6 +277,10 @@ test('gọi số phát call.issued đồng thời ba kênh với cùng payload',
   expect(call.status).toBe(200);
   expect((await call.json()).number).toBe(ticket.number);
 
+  // Đua gọi số: người bấm sau nhận 409, không phát sự kiện thứ hai.
+  const second = await api(`/api/tickets/${ticket.id}/call`, { method: 'POST', cookie: receptionistCookie });
+  expect(second.status).toBe(409);
+
   await vi.waitFor(() => {
     expect(payloads.tv.length).toBe(1);
     expect(payloads.track.length).toBe(1);
@@ -321,6 +325,8 @@ test('mặt công cộng zero-PII: không tên, CCCD, BHYT, SĐT; mã sai trả 
   expect(tvText).not.toContain('nationalId');
   expect(tvText).not.toContain('insuranceNo');
   expect(tvText).not.toContain('phone');
+  expect(tvText).not.toContain('trackingCode');
+  expect(tvText).not.toContain('ticketId');
 
   const track = await (await api(`/api/public/track/${ticket.trackingCode}`)).json();
   const trackText = JSON.stringify(track);

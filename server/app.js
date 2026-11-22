@@ -244,7 +244,8 @@ export function createApp({ vite = null, distDir = null } = {}) {
       .emit('call.issued', publicTicketView(ticket));
   }
 
-  // Gọi số: waiting → called, ghi sự kiện trong transaction rồi phát ba kênh một lần.
+  // Gọi số: waiting → called bằng cập nhật có điều kiện (compare-and-swap) — hai lễ tân bấm
+  // cùng số chỉ một người thắng; ghi sự kiện trong transaction rồi phát ba kênh một lần.
   app.post('/api/tickets/:id/call', requireRole('RECEPTIONIST'), async (req, res, next) => {
     const actor = req.session.user;
     try {
@@ -252,25 +253,29 @@ export function createApp({ vite = null, distDir = null } = {}) {
         const current = await tx.queueTicket.findUnique({ where: { id: req.params.id } });
         if (!current) throw httpError(404, 'Không tìm thấy thẻ hàng đợi');
         if (current.status !== 'waiting') throw httpError(409, `Thẻ đang ở trạng thái ${current.status}, không gọi được`);
-        const updated = await tx.queueTicket.update({ where: { id: current.id }, data: { status: 'called' } });
+        const swapped = await tx.queueTicket.updateMany({
+          where: { id: current.id, status: 'waiting' },
+          data: { status: 'called' },
+        });
+        if (swapped.count === 0) throw httpError(409, 'Thẻ vừa được gọi bởi một thao tác khác');
         await recordEvent(tx, {
           type: 'queue.ticket.changed',
           aggregateId: current.id,
           payload: { ticketId: current.id, number: current.number, dateKey: current.dateKey, from: 'waiting', to: 'called', reason: 'call' },
           actor: { type: 'user', id: actor.id, label: actor.displayName },
         });
-        return updated;
+        return { ...current, status: 'called' };
       });
       broadcastCall(req.app.get('io'), ticket);
       res.json(publicTicketView(ticket));
     } catch (err) { next(err); }
   });
 
-  // Mặt TV công cộng: lượt đang gọi + kế tiếp, zero-PII.
+  // Mặt TV công cộng: lượt đang gọi + kế tiếp, zero-PII, chỉ ngày hôm nay.
   app.get('/api/public/tv', async (req, res, next) => {
     try {
       const tickets = await prisma.queueTicket.findMany({
-        where: { dateKey: String(req.query.dateKey ?? dateKeyOf(new Date())) },
+        where: { dateKey: dateKeyOf(new Date()) },
         orderBy: { number: 'asc' },
       });
       res.json(tvSnapshot(tickets));
