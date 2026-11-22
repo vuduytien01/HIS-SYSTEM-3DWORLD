@@ -3,6 +3,7 @@ import {
   apiSearchPatients, apiCreatePatient, apiCheckInAppointment, apiWalkInCheckIn, apiAppointments, apiTickets,
   apiCallTicket, apiParkTicket, apiRecallTicket, apiPresentTicket, apiSkipTicket, apiRejoinTicket, apiSweep,
   apiRooms, apiSuggestRooms, apiAssignTicket, apiAdmitTicket,
+  apiUndoTicket, apiOverrideComplete, apiOverrideReasons,
 } from '../api.js';
 import { ROLE_LABELS } from '../roles.js';
 import { GENDER_OPTIONS, genderOptionsHtml } from '../patient-fields.js';
@@ -119,6 +120,10 @@ export function renderReception(root, user) {
       { act: 'recall', label: 'Gọi lại', api: apiRecallTicket },
       { act: 'present', label: 'Có mặt', api: apiPresentTicket },
       { act: 'skip', label: 'Bỏ lượt', api: apiSkipTicket },
+    ],
+    present: [
+      { act: 'undo', label: 'Hoàn tác', api: (id) => apiUndoTicket(id, '') },
+      { act: 'override', label: 'Override đóng', api: (id) => apiOverrideComplete(id, '') },
     ],
     skipped: [{ act: 'rejoin', label: 'Quay lại', api: apiRejoinTicket }],
     'no-show': [{ act: 'rejoin', label: 'Quay lại', api: apiRejoinTicket }],
@@ -237,6 +242,73 @@ export function renderReception(root, user) {
   });
 
   // Nút một cú bấm từ bảng: server là thẩm quyền, client chỉ chuyển tiếp.
+  let overrideReasons = [];
+
+  async function loadOverrideReasons() {
+    try {
+      overrideReasons = (await apiOverrideReasons()).reasons;
+    } catch { overrideReasons = ['khẩn cấp', 'lỗi nhập', 'bệnh nhân yêu cầu', 'phòng hỏng', 'khác']; }
+  }
+
+  async function promptReason(title, defaultReason = '') {
+    return new Promise((resolve) => {
+      const overlay = document.createElement('div');
+      overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:1000';
+      overlay.innerHTML = `
+        <div style="background:#fff;padding:24px;border-radius:10px;min-width:320px;box-shadow:0 8px 24px rgba(0,0,0,.2)">
+          <h3 style="margin:0 0 12px">${title}</h3>
+          <select id="reason-select" style="width:100%;padding:8px;border:1px solid #d1d5db;border-radius:6px;margin-bottom:12px">
+            ${overrideReasons.map((r) => `<option value="${r}">${r}</option>`).join('')}
+            <option value="">Khác (nhập tự do)</option>
+          </select>
+          <input id="reason-custom" type="text" placeholder="Nhập lý do khác" style="width:100%;padding:8px;border:1px solid #d1d5db;border-radius:6px;margin-bottom:12px;display:none">
+          <div style="display:flex;gap:8px;justify-content:flex-end">
+            <button id="reason-cancel" style="padding:8px 16px;border:1px solid #d1d5db;border-radius:6px;background:#fff">Hủy</button>
+            <button id="reason-ok" class="primary" style="padding:8px 16px">Xác nhận</button>
+          </div>
+        </div>`;
+      document.body.appendChild(overlay);
+      const select = overlay.querySelector('#reason-select');
+      const custom = overlay.querySelector('#reason-custom');
+      select.value = defaultReason;
+      select.addEventListener('change', () => {
+        custom.style.display = select.value === '' ? 'block' : 'none';
+      });
+      if (defaultReason && !overrideReasons.includes(defaultReason)) {
+        custom.value = defaultReason;
+        custom.style.display = 'block';
+      }
+      const cleanup = () => { overlay.remove(); };
+      overlay.querySelector('#reason-ok').addEventListener('click', () => {
+        const val = select.value === '' ? custom.value.trim() : select.value;
+        if (!val) { alert('Vui lòng chọn hoặc nhập lý do'); return; }
+        resolve(val);
+        cleanup();
+      });
+      overlay.querySelector('#reason-cancel').addEventListener('click', () => { resolve(null); cleanup(); });
+      overlay.addEventListener('click', (e) => { if (e.target === overlay) { resolve(null); cleanup(); } });
+    });
+  }
+
+  async function handleActionWithReason(action, ticketId, reasonRequired = true) {
+    let reason = '';
+    if (reasonRequired) {
+      await loadOverrideReasons();
+      reason = await promptReason('Chọn lý do');
+      if (!reason) return;
+    }
+    try {
+      const res = action === 'undo'
+        ? await apiUndoTicket(ticketId, reason)
+        : await apiOverrideComplete(ticketId, reason);
+      toast(`Số ${res.number ?? res.visit?.id}: đã xử lý`);
+      await refreshLists();
+    } catch (err) {
+      setMsg(err.message, true);
+    }
+  }
+
+  // Nút một cú bấm từ bảng: server là thẩm quyền, client chỉ chuyển tiếp.
   $('#ticket-tbody').addEventListener('click', async (e) => {
     const assignBtn = e.target.closest('button[data-assign-go]');
     if (assignBtn) {
@@ -256,8 +328,12 @@ export function renderReception(root, user) {
     try {
       const res = btn.dataset.action === 'admit'
         ? await apiAdmitTicket(btn.dataset.id)
-        : await Object.values(TICKET_ACTIONS).flat().find((a) => a.act === btn.dataset.action).api(btn.dataset.id);
-      toast(`Số ${res.number}: ${QUEUE_STATUS_LABELS[res.status] ?? res.room?.name ?? 'đã xử lý'}`);
+        : btn.dataset.action === 'undo'
+          ? await handleActionWithReason('undo', btn.dataset.id, true)
+          : btn.dataset.action === 'override'
+            ? await handleActionWithReason('override', btn.dataset.id, true)
+            : await Object.values(TICKET_ACTIONS).flat().find((a) => a.act === btn.dataset.action).api(btn.dataset.id);
+      if (res && res.number) toast(`Số ${res.number}: ${QUEUE_STATUS_LABELS[res.status] ?? res.room?.name ?? 'đã xử lý'}`);
       await refreshLists();
     } catch (err) {
       setMsg(err.message, true);

@@ -60,6 +60,13 @@ export const apiAdmitTicket = (id) => fetchJson(`/api/tickets/${encodeURICompone
 export const apiReassignTicket = (id, roomId) =>
   fetchJson(`/api/tickets/${encodeURIComponent(id)}/reassign`, { method: 'POST', body: JSON.stringify({ roomId }) });
 
+// ---- Ticket 06: Hoàn tác 3 mức + Override ----
+export const apiUndoTicket = (id, reason = '') =>
+  fetchJson(`/api/tickets/${encodeURIComponent(id)}/undo`, { method: 'POST', body: JSON.stringify({ reason }) });
+export const apiOverrideComplete = (id, reason) =>
+  fetchJson(`/api/tickets/${encodeURIComponent(id)}/override-complete`, { method: 'POST', body: JSON.stringify({ reason }) });
+export const apiOverrideReasons = () => fetchJson('/api/config/override-reasons');
+
 export function connectSocket(options = {}) {
   return io({ withCredentials: true, ...options });
 }

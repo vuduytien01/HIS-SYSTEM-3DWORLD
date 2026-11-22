@@ -632,3 +632,151 @@ test('xung đột hai màn hình xếp cùng phòng: một thắng, một nhận
   const activeVisits = await prisma.visit.count({ where: { roomId: p01.id, status: { in: ['planned', 'in-progress', 'on-hold'] } } });
   expect(activeVisits).toBe(1);
 });
+
+test('hoàn tác mức 1: present + visit planned → revoke assignment, room free, ticket waiting', async () => {
+  const mk = await api('/api/patients', { method: 'POST', cookie: receptionistCookie, body: patientPayload('Đậu Hoàn Tác 1') });
+  const { patient } = await mk.json();
+  const check = await api(`/api/patients/${patient.id}/check-in`, { method: 'POST', cookie: receptionistCookie });
+  const { ticket } = await check.json();
+  await api(`/api/tickets/${ticket.id}/call`, { method: 'POST', cookie: receptionistCookie });
+  await api(`/api/tickets/${ticket.id}/present`, { method: 'POST', cookie: receptionistCookie });
+
+  const { rooms } = await (await api('/api/rooms', { cookie: receptionistCookie })).json();
+  const p01 = rooms.find((r) => r.code === 'P01');
+  const assign = await api(`/api/tickets/${ticket.id}/assign`, { method: 'POST', cookie: receptionistCookie, body: { roomId: p01.id } });
+  expect(assign.status).toBe(200);
+  const { visit } = await assign.json();
+  expect(visit.status).toBe('planned');
+
+  const undo = await api(`/api/tickets/${ticket.id}/undo`, { method: 'POST', cookie: receptionistCookie });
+  expect(undo.status).toBe(200);
+  expect((await undo.json()).level).toBe(1);
+  expect((await undo.json()).action).toBe('undo-pre-call');
+
+  const room = await prisma.room.findUnique({ where: { id: p01.id } });
+  expect(room.state).toBe('free');
+  const v = await prisma.visit.findUnique({ where: { id: visit.id } });
+  expect(v.status).toBe('cancelled');
+  const t = await prisma.queueTicket.findUnique({ where: { id: ticket.id } });
+  expect(t.status).toBe('waiting');
+
+  const event = await prisma.event.findFirst({ where: { type: 'assignment.revoked', aggregateId: ticket.id } });
+  expect(JSON.parse(event.payload).reason).toBe('undo-pre-call');
+});
+
+test('hoàn tác mức 2: present + visit in-progress → bắt buộc lý do, chuyển reassign', async () => {
+  const mk = await api('/api/patients', { method: 'POST', cookie: receptionistCookie, body: patientPayload('Đậu Hoàn Tác 2') });
+  const { patient } = await mk.json();
+  const check = await api(`/api/patients/${patient.id}/check-in`, { method: 'POST', cookie: receptionistCookie });
+  const { ticket } = await check.json();
+  await api(`/api/tickets/${ticket.id}/call`, { method: 'POST', cookie: receptionistCookie });
+  await api(`/api/tickets/${ticket.id}/present`, { method: 'POST', cookie: receptionistCookie });
+
+  const { rooms } = await (await api('/api/rooms', { cookie: receptionistCookie })).json();
+  const p01 = rooms.find((r) => r.code === 'P01');
+  const assign = await api(`/api/tickets/${ticket.id}/assign`, { method: 'POST', cookie: receptionistCookie, body: { roomId: p01.id } });
+  expect(assign.status).toBe(200);
+  const { visit } = await assign.json();
+  await api(`/api/tickets/${ticket.id}/admit`, { method: 'POST', cookie: receptionistCookie });
+
+  // Thiếu lý do → 400
+  const noReason = await api(`/api/tickets/${ticket.id}/undo`, { method: 'POST', cookie: receptionistCookie, body: { reason: '' } });
+  expect(noReason.status).toBe(400);
+
+  // Có lý do → thành công
+  const undo = await api(`/api/tickets/${ticket.id}/undo`, { method: 'POST', cookie: receptionistCookie, body: { reason: 'lỗi nhập' } });
+  expect(undo.status).toBe(200);
+  expect((await undo.json()).level).toBe(2);
+  expect((await undo.json()).action).toBe('undo-post-call');
+
+  const room = await prisma.room.findUnique({ where: { id: p01.id } });
+  expect(room.state).toBe('free');
+  const v = await prisma.visit.findUnique({ where: { id: visit.id } });
+  expect(v.status).toBe('cancelled');
+
+  const event = await prisma.event.findFirst({ where: { type: 'assignment.revoked', aggregateId: ticket.id } });
+  expect(JSON.parse(event.payload).undoReason).toBe('lỗi nhập');
+  expect(event.payload).toContain('undo-post-call');
+});
+
+test('hoàn tác mức 3: visit completed (receiving-care) → chặn 409', async () => {
+  const mk = await api('/api/patients', { method: 'POST', cookie: receptionistCookie, body: patientPayload('Đậu Hoàn Tác 3') });
+  const { patient } = await mk.json();
+  const check = await api(`/api/patients/${patient.id}/check-in`, { method: 'POST', cookie: receptionistCookie });
+  const { ticket } = await check.json();
+  await api(`/api/tickets/${ticket.id}/call`, { method: 'POST', cookie: receptionistCookie });
+  await api(`/api/tickets/${ticket.id}/present`, { method: 'POST', cookie: receptionistCookie });
+
+  const { rooms } = await (await api('/api/rooms', { cookie: receptionistCookie })).json();
+  const p01 = rooms.find((r) => r.code === 'P01');
+  const assign = await api(`/api/tickets/${ticket.id}/assign`, { method: 'POST', cookie: receptionistCookie, body: { roomId: p01.id } });
+  await api(`/api/tickets/${ticket.id}/admit`, { method: 'POST', cookie: receptionistCookie });
+
+  const v = await prisma.visit.findFirst({ where: { ticketId: ticket.id } });
+  await prisma.visit.update({ where: { id: v.id }, data: { status: 'completed' } });
+
+  const undo = await api(`/api/tickets/${ticket.id}/undo`, { method: 'POST', cookie: receptionistCookie, body: { reason: 'khẩn cấp' } });
+  expect(undo.status).toBe(409);
+  expect((await undo.json()).error).toContain('receiving-care');
+});
+
+test('override hoàn tất: bắt buộc chọn lý do từ danh sách cấu hình', async () => {
+  const mk = await api('/api/patients', { method: 'POST', cookie: receptionistCookie, body: patientPayload('Đậu Override') });
+  const { patient } = await mk.json();
+  const check = await api(`/api/patients/${patient.id}/check-in`, { method: 'POST', cookie: receptionistCookie });
+  const { ticket } = await check.json();
+  await api(`/api/tickets/${ticket.id}/call`, { method: 'POST', cookie: receptionistCookie });
+  await api(`/api/tickets/${ticket.id}/present`, { method: 'POST', cookie: receptionistCookie });
+
+  const { rooms } = await (await api('/api/rooms', { cookie: receptionistCookie })).json();
+  const p01 = rooms.find((r) => r.code === 'P01');
+  const assign = await api(`/api/tickets/${ticket.id}/assign`, { method: 'POST', cookie: receptionistCookie, body: { roomId: p01.id } });
+  await api(`/api/tickets/${ticket.id}/admit`, { method: 'POST', cookie: receptionistCookie });
+
+  // Lý do không trong danh sách → 400
+  const bad = await api(`/api/tickets/${ticket.id}/override-complete`, { method: 'POST', cookie: receptionistCookie, body: { reason: 'lý do không hợp lệ' } });
+  expect(bad.status).toBe(400);
+  expect((await bad.json()).error).toContain('lý do phải là một trong');
+
+  // Lý do hợp lệ → thành công
+  const good = await api(`/api/tickets/${ticket.id}/override-complete`, { method: 'POST', cookie: receptionistCookie, body: { reason: 'khẩn cấp' } });
+  expect(good.status).toBe(200);
+
+  const v = await prisma.visit.findFirst({ where: { ticketId: ticket.id } });
+  expect(v.status).toBe('discontinued');
+  expect(v.discontinuedReason).toBe('khẩn cấp');
+
+  const room = await prisma.room.findUnique({ where: { id: p01.id } });
+  expect(room.state).toBe('free');
+
+  const event = await prisma.event.findFirst({ where: { type: 'assignment.revoked', aggregateId: ticket.id } });
+  expect(JSON.parse(event.payload).reason).toBe('override-complete');
+  expect(JSON.parse(event.payload).overrideReason).toBe('khẩn cấp');
+});
+
+test('Provenance: mọi undo/override ghi actor, timestamp server, thao tác, lý do', async () => {
+  const mk = await api('/api/patients', { method: 'POST', cookie: receptionistCookie, body: patientPayload('Đậu Provenance') });
+  const { patient } = await mk.json();
+  const check = await api(`/api/patients/${patient.id}/check-in`, { method: 'POST', cookie: receptionistCookie });
+  const { ticket } = await check.json();
+  await api(`/api/tickets/${ticket.id}/call`, { method: 'POST', cookie: receptionistCookie });
+  await api(`/api/tickets/${ticket.id}/present`, { method: 'POST', cookie: receptionistCookie });
+
+  const { rooms } = await (await api('/api/rooms', { cookie: receptionistCookie })).json();
+  const p01 = rooms.find((r) => r.code === 'P01');
+  const assign = await api(`/api/tickets/${ticket.id}/assign`, { method: 'POST', cookie: receptionistCookie, body: { roomId: p01.id } });
+  await api(`/api/tickets/${ticket.id}/admit`, { method: 'POST', cookie: receptionistCookie });
+
+  const undo = await api(`/api/tickets/${ticket.id}/undo`, { method: 'POST', cookie: receptionistCookie, body: { reason: 'lỗi nhập' } });
+  expect(undo.status).toBe(200);
+
+  const event = await prisma.event.findFirst({
+    where: { type: 'assignment.revoked', aggregateId: ticket.id },
+    orderBy: { occurredAt: 'desc' },
+  });
+  const payload = JSON.parse(event.payload);
+  expect(payload.undoReason).toBe('lỗi nhập');
+  expect(event.actorType).toBe('user');
+  expect(event.actorLabel).toBe('Lễ tân test');
+  expect(Math.abs(Date.now() - new Date(event.occurredAt).getTime())).toBeLessThan(60_000);
+});

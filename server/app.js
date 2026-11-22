@@ -13,7 +13,7 @@ import { recordEvent } from './events.js';
 import { dateKeyOf, dayBounds, issueQueueTicket, retryOnTicketRace } from './queue.js';
 import { parsePatientInput, findOrCreatePatient, publicPatient, foldName } from './patients.js';
 import { tvAction, publicTicketView, tvSnapshot, trackSnapshot } from './queue-projection.js';
-import { getConfigParam } from './config-params.js';
+import { getConfigParam, getOverrideReasons } from './config-params.js';
 
 const CLIENT_DIR = path.resolve(process.cwd(), 'client');
 
@@ -713,6 +713,136 @@ export function createApp({ vite = null, distDir = null } = {}) {
         .filter((r) => (loadByRoom.get(r.id) ?? 0) < r.capacity)
         .sort((a, b) => (loadByRoom.get(a.id) ?? 0) - (loadByRoom.get(b.id) ?? 0) || a.code.localeCompare(b.code));
       res.json({ rooms: suggestions.map((r) => ({ ...publicRoom(r), load: loadByRoom.get(r.id) ?? 0 })) });
+    } catch (err) { next(err); }
+  });
+
+  // ---- Ticket 06: Hoàn tác 3 mức + Override bắt lý do + Audit Provenance ----
+
+  // Hoàn tác xếp phòng: 3 mức theo thời điểm tín hiệu vào phòng.
+  // Mức 1: trước tín hiệu (visit planned/reserved) → revoke assignment, room free, ticket về waiting.
+  // Mức 2: sau tín hiệu (visit in-progress/occupied) → chuyển thành reassign, bắt buộc lý do.
+  // Mức 3: receiving-care (bác sĩ đang khám) → chặn, trả 409.
+  app.post('/api/tickets/:id/undo', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
+    const reason = String(req.body?.reason ?? '').trim();
+    const now = new Date();
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        const ticket = await tx.queueTicket.findUnique({ where: { id: req.params.id }, include: { visit: true } });
+        if (!ticket) throw httpError(404, 'Không tìm thấy thẻ hàng đợi');
+        if (!ticket.visit) throw httpError(409, 'Thẻ chưa được xếp phòng');
+
+        const visit = ticket.visit;
+        const room = await tx.room.findUnique({ where: { id: visit.roomId } });
+        if (!room) throw httpError(404, 'Không tìm thấy phòng');
+
+        // Mức 1: trước tín hiệu vào phòng (planned/reserved) — hoàn tác sạch, không hỏi lý do.
+        if (visit.status === 'planned') {
+          // Revoke assignment: room free, visit cancelled, ticket waiting.
+          await tx.visitLocation.updateMany({ where: { visitId: visit.id }, data: { status: 'completed', endedAt: now } });
+          await tx.visit.update({ where: { id: visit.id }, data: { status: 'cancelled' } });
+          const swapped = await tx.room.updateMany({ where: { id: room.id, state: room.state }, data: { state: 'free' } });
+          if (swapped.count === 0) throw httpError(409, 'Phòng vừa bị thay đổi');
+          const freshRoom = await tx.room.findUnique({ where: { id: room.id } });
+          await recordEvent(tx, {
+            type: 'assignment.revoked',
+            aggregateId: ticket.id,
+            payload: { ticketId: ticket.id, visitId: visit.id, roomId: room.id, reason: 'undo-pre-call' },
+            actor,
+          });
+          await recordEvent(tx, {
+            type: 'room.state.changed',
+            aggregateId: freshRoom.id,
+            payload: { roomId: freshRoom.id, from: room.state, to: 'free', ticketId: ticket.id },
+            actor,
+          });
+          return { level: 1, action: 'undo-pre-call', ticket: { ...ticket, status: 'waiting' }, room: freshRoom };
+        }
+
+        // Mức 2: sau tín hiệu (in-progress/occupied) — chuyển thành reassign, bắt buộc lý do.
+        if (visit.status === 'in-progress' || visit.status === 'on-hold') {
+          if (!reason) throw httpError(400, 'Hoàn tác sau khi đã vào phòng bắt buộc chọn lý do');
+          // Cancel visit hiện tại, ticket về waiting, room free.
+          await tx.visitLocation.updateMany({ where: { visitId: visit.id, status: { in: ['active', 'planned'] } }, data: { status: 'completed', endedAt: now } });
+          await tx.visit.update({ where: { id: visit.id }, data: { status: 'cancelled' } });
+          const swapped = await tx.room.updateMany({ where: { id: room.id, state: room.state }, data: { state: 'free' } });
+          if (swapped.count === 0) throw httpError(409, 'Phòng vừa bị thay đổi');
+          const freshRoom = await tx.room.findUnique({ where: { id: room.id } });
+          await recordEvent(tx, {
+            type: 'assignment.revoked',
+            aggregateId: ticket.id,
+            payload: { ticketId: ticket.id, visitId: visit.id, roomId: room.id, reason: 'undo-post-call', undoReason: reason },
+            actor,
+          });
+          await recordEvent(tx, {
+            type: 'room.state.changed',
+            aggregateId: freshRoom.id,
+            payload: { roomId: freshRoom.id, from: room.state, to: 'free', ticketId: ticket.id },
+            actor,
+          });
+          return { level: 2, action: 'undo-post-call', ticket: { ...ticket, status: 'waiting' }, room: freshRoom };
+        }
+
+        // Mức 3: receiving-care (bác sĩ đang khám) — chặn.
+        if (visit.status === 'completed') {
+          throw httpError(409, 'Bệnh nhân đang receiving-care, không thể hoàn tác');
+        }
+        throw httpError(409, `Không thể hoàn tác ở trạng thái ${visit.status}`);
+      });
+      res.json(result);
+    } catch (err) { next(err); }
+  });
+
+  // Override đóng completed cho phòng khác: bắt buộc chọn lý do từ danh sách cấu hình.
+  app.post('/api/tickets/:id/override-complete', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
+    const reason = String(req.body?.reason ?? '').trim();
+    const now = new Date();
+    try {
+      const reasons = await getOverrideReasons();
+      if (!reasons.includes(reason)) throw httpError(400, `Lý do phải là một trong: ${reasons.join(', ')}`);
+      const result = await prisma.$transaction(async (tx) => {
+        const ticket = await tx.queueTicket.findUnique({ where: { id: req.params.id }, include: { visit: true } });
+        if (!ticket) throw httpError(404, 'Không tìm thấy thẻ hàng đợi');
+        if (!ticket.visit) throw httpError(409, 'Thẻ chưa có lượt khám');
+        const visit = ticket.visit;
+        if (visit.status !== 'in-progress') throw httpError(409, `Chỉ override được khi đang in-progress (hiện ${visit.status})`);
+        // Cancel visit, ticket về waiting, room free.
+        const room = await tx.room.findUnique({ where: { id: visit.roomId } });
+        await tx.visitLocation.updateMany({ where: { visitId: visit.id, status: { in: ['active', 'planned'] } }, data: { status: 'completed', endedAt: now } });
+        await tx.visit.update({ where: { id: visit.id }, data: { status: 'discontinued', discontinuedReason: reason } });
+        if (room) {
+          const swapped = await tx.room.updateMany({ where: { id: room.id, state: room.state }, data: { state: 'free' } });
+          if (swapped.count === 0) throw httpError(409, 'Phòng vừa bị thay đổi');
+        }
+        await recordEvent(tx, {
+          type: 'assignment.revoked',
+          aggregateId: ticket.id,
+          payload: { ticketId: ticket.id, visitId: visit.id, roomId: room?.id, reason: 'override-complete', overrideReason: reason },
+          actor,
+        });
+        if (room) {
+          const swapped = await tx.room.updateMany({ where: { id: room.id, state: room.state }, data: { state: 'free' } });
+          if (swapped.count === 0) throw httpError(409, 'Phòng vừa bị thay đổi');
+          const freshRoom = await tx.room.findUnique({ where: { id: room.id } });
+          await recordEvent(tx, {
+            type: 'room.state.changed',
+            aggregateId: freshRoom.id,
+            payload: { roomId: freshRoom.id, from: room.state, to: 'free', ticketId: ticket.id, reason: 'override-complete' },
+            actor,
+          });
+        }
+        return { visit, room };
+      });
+      res.json({ message: 'Override thành công', reason });
+    } catch (err) { next(err); }
+  });
+
+  // Danh sách lý do override cấu hình.
+  app.get('/api/config/override-reasons', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    try {
+      const reasons = await getOverrideReasons();
+      res.json({ reasons });
     } catch (err) { next(err); }
   });
 
