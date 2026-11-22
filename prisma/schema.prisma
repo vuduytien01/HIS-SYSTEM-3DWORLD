@@ -82,23 +82,34 @@ model Appointment {
 
 // Thẻ hàng đợi hạng nhất — STT cấp theo ngày, reset mỗi sáng (dateKey).
 model QueueTicket {
-  id           String   @id @default(cuid())
-  patientId    String
-  patient      Patient  @relation(fields: [patientId], references: [id])
+  id            String    @id @default(cuid())
+  patientId     String
+  patient       Patient   @relation(fields: [patientId], references: [id])
   appointmentId String?
-  appointment  Appointment? @relation(fields: [appointmentId], references: [id])
-  dateKey      String // YYYY-MM-DD theo giờ server
-  number       Int
+  appointment   Appointment? @relation(fields: [appointmentId], references: [id])
+  dateKey       String // YYYY-MM-DD theo giờ server
+  number        Int
   // 8 ký tự hex in trên phiếu STT — bệnh nhân theo dõi kênh web bằng mã, không cần tài khoản
-  trackingCode String   @unique
+  trackingCode  String    @unique
   // waiting|called|present|parked|skipped|no-show
-  status       String   @default("waiting")
-  issuedAt     DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  status        String    @default("waiting")
+  callAttempts  Int       @default(0)
+  parkedUntil   DateTime?
+  presencedAt   DateTime?
+  skippedAt     DateTime?
+  issuedAt      DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
 
   @@unique([dateKey, number])
   @@index([dateKey, status])
   @@index([patientId])
+}
+
+// Tham số vận hành — key-value đọc qua getConfigParam; màn chỉnh của admin vào ticket 12.
+model Config {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
 }
 
 // Kho sự kiện append-only — timestamp server, chỉ ghi thêm. 7 nhóm theo spec.

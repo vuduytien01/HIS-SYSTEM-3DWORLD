@@ -40,6 +40,17 @@ export const apiCallTicket = (id) => fetchJson(`/api/tickets/${encodeURIComponen
 export const apiPublicTv = () => fetchJson('/api/public/tv');
 export const apiPublicTrack = (code) => fetchJson(`/api/public/track/${encodeURIComponent(code)}`);
 
+// ---- Ticket 04: giao thức gọi không có mặt ----
+export const apiParkTicket = (id, parkedUntil) =>
+  fetchJson(`/api/tickets/${encodeURIComponent(id)}/park`, { method: 'POST', body: JSON.stringify({ parkedUntil }) });
+export const apiRecallTicket = (id) => fetchJson(`/api/tickets/${encodeURIComponent(id)}/recall`, { method: 'POST' });
+export const apiPresentTicket = (id) => fetchJson(`/api/tickets/${encodeURIComponent(id)}/present`, { method: 'POST' });
+export const apiSkipTicket = (id) => fetchJson(`/api/tickets/${encodeURIComponent(id)}/skip`, { method: 'POST' });
+export const apiRejoinTicket = (id) => fetchJson(`/api/tickets/${encodeURIComponent(id)}/rejoin`, { method: 'POST' });
+export const apiSweep = () => fetchJson('/api/sweep', { method: 'POST' });
+export const apiPublicConfirmPresence = (code) =>
+  fetchJson(`/api/public/track/${encodeURIComponent(code)}/confirm`, { method: 'POST' });
+
 export function connectSocket(options = {}) {
   return io({ withCredentials: true, ...options });
 }

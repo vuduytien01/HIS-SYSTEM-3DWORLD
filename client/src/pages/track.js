@@ -1,5 +1,5 @@
 // Kênh web công cộng (/track): bệnh nhân theo dõi trạng thái của mình bằng mã trên phiếu STT — zero-PII.
-import { apiPublicTrack, connectSocket } from '../api.js';
+import { apiPublicTrack, apiPublicConfirmPresence, connectSocket } from '../api.js';
 
 const STATUS_LABELS = {
   waiting: 'Đang chờ đến lượt',
@@ -23,6 +23,10 @@ export function renderTrack(root) {
         <p class="track-number"></p>
         <p class="track-status"></p>
         <p class="muted track-action"></p>
+        <div id="presence-ask" hidden>
+          <p class="track-ask">Bạn có mặt tại quầy không?</p>
+          <button id="confirm-presence" class="primary">Tôi có mặt</button>
+        </div>
       </div>
       <p id="track-msg"></p>
     </div>
@@ -30,6 +34,7 @@ export function renderTrack(root) {
 
   const $ = (sel) => root.querySelector(sel);
   let current = null;
+  let trackedCode = null;
   let socket = null;
 
   function render(snapshot) {
@@ -39,6 +44,8 @@ export function renderTrack(root) {
     $('#track-number').textContent = `Số của bạn: ${snapshot.number}`;
     $('#track-status').querySelector('.track-status').textContent = STATUS_LABELS[snapshot.status] ?? snapshot.status;
     $('#track-action').textContent = snapshot.action;
+    // Câu hỏi có mặt trong lúc gọi/tạm giữ (ticket 04) — mọi nguồn xác nhận ghi cùng một marker.
+    $('#presence-ask').hidden = !(snapshot.status === 'called' || snapshot.status === 'parked');
   }
 
   $('#track-form').addEventListener('submit', async (e) => {
@@ -46,6 +53,7 @@ export function renderTrack(root) {
     const code = String(new FormData(e.target).get('code') ?? '').trim();
     const msg = $('#track-msg');
     try {
+      trackedCode = code;
       render(await apiPublicTrack(code));
       msg.textContent = '';
       if (!socket) {
@@ -59,6 +67,20 @@ export function renderTrack(root) {
           }
         });
       }
+    } catch (err) {
+      msg.className = 'error-text';
+      msg.textContent = err.message;
+    }
+  });
+
+  // Xác nhận có mặt từ kênh web — cùng marker với quầy/lễ tân, server là thẩm quyền.
+  $('#confirm-presence').addEventListener('click', async () => {
+    if (!trackedCode) return;
+    const msg = $('#track-msg');
+    try {
+      render(await apiPublicConfirmPresence(trackedCode));
+      msg.className = 'ok-line';
+      msg.textContent = 'Đã ghi nhận bạn có mặt.';
     } catch (err) {
       msg.className = 'error-text';
       msg.textContent = err.message;

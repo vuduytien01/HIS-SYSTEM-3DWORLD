@@ -17,5 +17,5 @@ export function tvSnapshot(tickets) {
 }
 
 export function trackSnapshot(t) {
-  return { number: t.number, dateKey: t.dateKey, status: t.status, action: tvAction(t) };
+  return { number: t.number, dateKey: t.dateKey, status: t.status, action: tvAction(t), parkedUntil: t.parkedUntil };
 }

@@ -73,6 +73,7 @@ beforeAll(async () => {
   server = http.createServer(app);
   // Route gọi số đọc io từ app — index.js cũng set như thế này.
   app.set('io', createIo(server));
+  await prisma.config.deleteMany();
   await new Promise((resolve) => server.listen(0, resolve));
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 
@@ -337,4 +338,112 @@ test('mặt công cộng zero-PII: không tên, CCCD, BHYT, SĐT; mã sai trả 
 
   const miss = await api('/api/public/track/ma-sai');
   expect(miss.status).toBe(404);
+});
+
+test('giao thức vắng mặt: park → gọi lại ×2 → từ chối lần 3 → skip → undo → sweep no-show → rejoin giữ số', async () => {
+  const created = await api('/api/patients', { method: 'POST', cookie: receptionistCookie, body: patientPayload('Trương Vắng Mặt') });
+  const { patient } = await created.json();
+  const check = await api(`/api/patients/${patient.id}/check-in`, { method: 'POST', cookie: receptionistCookie });
+  const { ticket } = await check.json();
+
+  const call = await api(`/api/tickets/${ticket.id}/call`, { method: 'POST', cookie: receptionistCookie });
+  expect(call.status).toBe(200);
+
+  // Tạm giữ một cú bấm — parkUntil bắt buộc do server tính theo cấu hình.
+  const park = await api(`/api/tickets/${ticket.id}/park`, { method: 'POST', cookie: receptionistCookie });
+  expect(park.status).toBe(200);
+  const parked = await park.json();
+  expect(parked.status).toBe('parked');
+  expect(new Date(parked.parkedUntil).getTime()).toBeGreaterThan(Date.now() - 1000);
+
+  // Gọi lại ×2 thành công (mặc định maxRecalls=2), lần 3 bị từ chối kèm lý do.
+  const recall1 = await api(`/api/tickets/${ticket.id}/recall`, { method: 'POST', cookie: receptionistCookie });
+  expect(recall1.status).toBe(200);
+  const park2 = await api(`/api/tickets/${ticket.id}/park`, { method: 'POST', cookie: receptionistCookie });
+  expect(park2.status).toBe(200);
+  const recall2 = await api(`/api/tickets/${ticket.id}/recall`, { method: 'POST', cookie: receptionistCookie });
+  expect(recall2.status).toBe(200);
+  const recall3 = await api(`/api/tickets/${ticket.id}/recall`, { method: 'POST', cookie: receptionistCookie });
+  expect(recall3.status).toBe(409);
+  expect((await recall3.json()).error).toContain('gọi lại đủ');
+
+  // Skip một cú bấm → undo ngay trong cửa sổ → reason 'undo'.
+  const skip = await api(`/api/tickets/${ticket.id}/skip`, { method: 'POST', cookie: receptionistCookie });
+  expect(skip.status).toBe(200);
+  const rejoin = await api(`/api/tickets/${ticket.id}/rejoin`, { method: 'POST', cookie: receptionistCookie });
+  expect(rejoin.status).toBe(200);
+  expect((await rejoin.json()).reason).toBe('undo');
+
+  // Skip lại rồi sweep cuối phiên → no-show; rejoin từ no-show giữ số gốc.
+  const skip2 = await api(`/api/tickets/${ticket.id}/skip`, { method: 'POST', cookie: receptionistCookie });
+  expect(skip2.status).toBe(200);
+  const sweep = await api('/api/sweep', { method: 'POST', cookie: receptionistCookie });
+  expect(sweep.status).toBe(200);
+  expect((await sweep.json()).moved).toBeGreaterThanOrEqual(1);
+
+  const rejoin2 = await api(`/api/tickets/${ticket.id}/rejoin`, { method: 'POST', cookie: receptionistCookie });
+  expect(rejoin2.status).toBe(200);
+  const r2 = await rejoin2.json();
+  expect(r2.reason).toBe('rejoin');
+  expect(r2.number).toBe(ticket.number);
+});
+
+test('xác nhận có mặt từ web và từ quầy ghi cùng marker với actor khác nhau', async () => {
+  const mkWeb = await api('/api/patients', { method: 'POST', cookie: receptionistCookie, body: patientPayload('Vương Mặt Web') });
+  const { patient: pWeb } = await mkWeb.json();
+  const checkWeb = await api(`/api/patients/${pWeb.id}/check-in`, { method: 'POST', cookie: receptionistCookie });
+  const { ticket: tWeb } = await checkWeb.json();
+  await api(`/api/tickets/${tWeb.id}/call`, { method: 'POST', cookie: receptionistCookie });
+
+  const confirm = await api(`/api/public/track/${tWeb.trackingCode}/confirm`, { method: 'POST' });
+  expect(confirm.status).toBe(200);
+  expect((await confirm.json()).status).toBe('present');
+
+  const eventWeb = await prisma.event.findFirst({
+    where: { aggregateId: tWeb.id, type: 'queue.ticket.changed' },
+    orderBy: { occurredAt: 'desc' },
+  });
+  expect(JSON.parse(eventWeb.payload).reason).toBe('present-web');
+  expect(eventWeb.actorType).toBe('patient-web');
+
+  const mkDesk = await api('/api/patients', { method: 'POST', cookie: receptionistCookie, body: patientPayload('Vương Mặt Quầy') });
+  const { patient: pDesk } = await mkDesk.json();
+  const checkDesk = await api(`/api/patients/${pDesk.id}/check-in`, { method: 'POST', cookie: receptionistCookie });
+  const { ticket: tDesk } = await checkDesk.json();
+  await api(`/api/tickets/${tDesk.id}/call`, { method: 'POST', cookie: receptionistCookie });
+
+  const present = await api(`/api/tickets/${tDesk.id}/present`, { method: 'POST', cookie: receptionistCookie });
+  expect(present.status).toBe(200);
+  expect((await present.json()).status).toBe('present');
+
+  const eventDesk = await prisma.event.findFirst({
+    where: { aggregateId: tDesk.id, type: 'queue.ticket.changed' },
+    orderBy: { occurredAt: 'desc' },
+  });
+  expect(JSON.parse(eventDesk.payload).reason).toBe('present-desk');
+  expect(eventDesk.actorType).toBe('user');
+});
+
+test('ngưỡng đọc từ cấu hình: maxRecalls=1 chặn gọi lại lần 2; undoWindowMs=0 → khôi phục là restore', async () => {
+  await prisma.config.create({ data: { key: 'maxRecalls', value: '1' } });
+  await prisma.config.create({ data: { key: 'undoWindowMs', value: '0' } });
+
+  const created = await api('/api/patients', { method: 'POST', cookie: receptionistCookie, body: patientPayload('Thành Cấu Hình') });
+  const { patient } = await created.json();
+  const check = await api(`/api/patients/${patient.id}/check-in`, { method: 'POST', cookie: receptionistCookie });
+  const { ticket } = await check.json();
+
+  await api(`/api/tickets/${ticket.id}/call`, { method: 'POST', cookie: receptionistCookie });
+  const recall1 = await api(`/api/tickets/${ticket.id}/recall`, { method: 'POST', cookie: receptionistCookie });
+  expect(recall1.status).toBe(200);
+  const recall2 = await api(`/api/tickets/${ticket.id}/recall`, { method: 'POST', cookie: receptionistCookie });
+  expect(recall2.status).toBe(409);
+
+  const skip = await api(`/api/tickets/${ticket.id}/skip`, { method: 'POST', cookie: receptionistCookie });
+  expect(skip.status).toBe(200);
+  const rejoin = await api(`/api/tickets/${ticket.id}/rejoin`, { method: 'POST', cookie: receptionistCookie });
+  expect(rejoin.status).toBe(200);
+  expect((await rejoin.json()).reason).toBe('restore');
+
+  await prisma.config.deleteMany();
 });

@@ -1,6 +1,7 @@
 // Màn lễ tân (ticket 02): ô tìm kiếm → hồ sơ → tiếp nhận trong một màn hình; danh sách hẹn + thẻ hàng đợi hôm nay.
 import {
   apiSearchPatients, apiCreatePatient, apiCheckInAppointment, apiWalkInCheckIn, apiAppointments, apiTickets,
+  apiCallTicket, apiParkTicket, apiRecallTicket, apiPresentTicket, apiSkipTicket, apiRejoinTicket, apiSweep,
 } from '../api.js';
 import { ROLE_LABELS } from '../roles.js';
 import { GENDER_OPTIONS, genderOptionsHtml } from '../patient-fields.js';
@@ -64,6 +65,7 @@ export function renderReception(root, user) {
           <thead><tr><th>STT</th><th>Giờ cấp</th><th>Bệnh nhân</th><th>Trạng thái</th><th>Thao tác</th></tr></thead>
           <tbody id="ticket-tbody"></tbody>
         </table>
+        <button id="sweep" class="primary">Sweep cuối phiên — skipped chuyển no-show</button>
       </section>
     </main>
     <div id="toast" class="toast" hidden></div>
@@ -100,15 +102,32 @@ export function renderReception(root, user) {
       : '<tr><td colspan="4" class="muted">Chưa có hẹn nào trong ngày.</td></tr>';
   }
 
+  // Nút một cú bấm theo trạng thái (ticket 04): gọi / gọi lại / có mặt / tạm giữ / bỏ lượt / quay lại.
+  const TICKET_ACTIONS = {
+    waiting: [['call', 'Gọi']],
+    called: [['recall', 'Gọi lại'], ['present', 'Có mặt'], ['park', 'Tạm giữ'], ['skip', 'Bỏ lượt']],
+    parked: [['recall', 'Gọi lại'], ['present', 'Có mặt'], ['skip', 'Bỏ lượt']],
+    skipped: [['rejoin', 'Quay lại']],
+    'no-show': [['rejoin', 'Quay lại']],
+  };
+
   function renderTickets(list) {
     $('#ticket-tbody').innerHTML = list.length
-      ? list.map((t) => `<tr>
-          <td>${t.number}</td>
-          <td>${timeOf(t.issuedAt)}</td>
-          <td>${esc(t.patient?.fullName ?? '')}</td>
-          <td>${esc(QUEUE_STATUS_LABELS[t.status] ?? t.status)}</td>
-          <td>${t.status === 'waiting' ? `<button class="primary" data-call="${esc(t.id)}">Gọi</button>` : ''}</td>
-        </tr>`).join('')
+      ? list.map((t) => {
+          const actions = (TICKET_ACTIONS[t.status] ?? [])
+            .map(([act, label]) => `<button class="primary" data-action="${act}" data-id="${esc(t.id)}">${label}</button>`)
+            .join(' ');
+          const badge = t.status === 'parked' && t.parkedUntil
+            ? `<span class="park-badge" data-until="${esc(t.parkedUntil)}">giữ đến ${timeOf(t.parkedUntil)}</span>`
+            : '';
+          return `<tr>
+            <td>${t.number}</td>
+            <td>${timeOf(t.issuedAt)}</td>
+            <td>${esc(t.patient?.fullName ?? '')}</td>
+            <td>${esc(QUEUE_STATUS_LABELS[t.status] ?? t.status)} ${badge}</td>
+            <td>${actions}</td>
+          </tr>`;
+        }).join('')
       : '<tr><td colspan="5" class="muted">Chưa có số nào trong ngày.</td></tr>';
   }
 
@@ -183,18 +202,51 @@ export function renderReception(root, user) {
     }
   });
 
-  // Gọi số từ bảng: một cú bấm → server phát 'call.issued' cho cả ba kênh.
-  $('#ticket-tbody').addEventListener('click', async (e) => {
-    const btn = e.target.closest('button[data-call]');
-    if (!btn) return;
+  // Nút một cú bấm từ bảng: map action → API, server là thẩm quyền.
+  const ACTION_API = {
+    call: apiCallTicket,
+    recall: apiRecallTicket,
+    present: apiPresentTicket,
+    park: (id) => apiParkTicket(id, null),
+    skip: apiSkipTicket,
+    rejoin: apiRejoinTicket,
+  };
+
+  $('#sweep').addEventListener('click', async () => {
     try {
-      const ticket = await apiCallTicket(btn.dataset.call);
-      toast(`Đã gọi số ${ticket.number}`);
+      const { moved } = await apiSweep();
+      toast(`Sweep: ${moved} thẻ skipped chuyển no-show`);
       await refreshLists();
     } catch (err) {
       setMsg(err.message, true);
     }
   });
+
+  $('#ticket-tbody').addEventListener('click', async (e) => {
+    const btn = e.target.closest('button[data-action]');
+    if (!btn) return;
+    try {
+      const res = await ACTION_API[btn.dataset.action](btn.dataset.id);
+      toast(`Số ${res.number}: ${QUEUE_STATUS_LABELS[res.status] ?? 'đã xử lý'}`);
+      await refreshLists();
+    } catch (err) {
+      setMsg(err.message, true);
+    }
+  });
+
+  // Badge đồng hồ tạm giữ đếm ngược mỗi giây cho lễ tân.
+  setInterval(() => {
+    root.querySelectorAll('.park-badge').forEach((el) => {
+      const left = new Date(el.dataset.until).getTime() - Date.now();
+      if (left <= 0) {
+        el.textContent = 'hết giờ giữ';
+        return;
+      }
+      const m = Math.floor(left / 60000);
+      const s = Math.floor((left % 60000) / 1000);
+      el.textContent = `giữ còn ${m}:${String(s).padStart(2, '0')}`;
+    });
+  }, 1000);
 
   $('#new-patient-form').addEventListener('submit', async (e) => {
     e.preventDefault();
