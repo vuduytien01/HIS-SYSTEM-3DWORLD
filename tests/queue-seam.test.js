@@ -3,6 +3,7 @@ import { beforeAll, afterAll, test, expect } from 'vitest';
 import { execSync } from 'node:child_process';
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
+import { dateKeyOf } from '../server/queue.js';
 
 process.env.DATABASE_URL = 'file:./prisma/test-queue.db';
 
@@ -12,11 +13,6 @@ let baseUrl;
 let receptionistCookie;
 let doctorCookie;
 const password = randomUUID();
-
-function dateKeyOf(date) {
-  const pad = (n) => String(n).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
-}
 
 async function login(username) {
   const res = await fetch(`${baseUrl}/api/auth/login`, {
@@ -122,6 +118,14 @@ test('tìm kiếm vài chữ đầu tên và số điện thoại trả gợi ý
     await api(`/api/patients/search?q=${encodeURIComponent('Nguyễn Đặt')}`, { cookie: receptionistCookie })
   ).json();
   expect(byName.patients.some((p) => p.fullName === 'Nguyễn Đặt Online')).toBe(true);
+  const byFolded = await (
+    await api(`/api/patients/search?q=${encodeURIComponent('nguyen dat online')}`, { cookie: receptionistCookie })
+  ).json();
+  expect(byFolded.patients.some((p) => p.fullName === 'Nguyễn Đặt Online')).toBe(true);
+  const byPhone = await (
+    await api(`/api/patients/search?q=${encodeURIComponent(byName.patients[0].phone.slice(0, 5))}`, { cookie: receptionistCookie })
+  ).json();
+  expect(byPhone.patients.some((p) => p.fullName === 'Nguyễn Đặt Online')).toBe(true);
 });
 
 test('lễ tân tạo hồ sơ mới với đầy đủ trường chuẩn', async () => {

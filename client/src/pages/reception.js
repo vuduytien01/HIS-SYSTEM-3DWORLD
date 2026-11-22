@@ -3,8 +3,9 @@ import {
   apiSearchPatients, apiCreatePatient, apiCheckInAppointment, apiWalkInCheckIn, apiAppointments, apiTickets,
 } from '../api.js';
 import { ROLE_LABELS } from '../roles.js';
+import { GENDER_OPTIONS, genderOptionsHtml } from '../patient-fields.js';
 
-const GENDER_LABELS = { male: 'Nam', female: 'Nữ', other: 'Khác', unknown: 'Không khai' };
+const GENDER_LABELS = Object.fromEntries(GENDER_OPTIONS.map((g) => [g.value, g.label]));
 const APPT_STATUS_LABELS = { booked: 'Đã đặt', 'checked-in': 'Đã tiếp nhận', cancelled: 'Đã hủy' };
 const QUEUE_STATUS_LABELS = { waiting: 'Chờ gọi', called: 'Đã gọi', present: 'Có mặt', parked: 'Tạm giữ', skipped: 'Bỏ lượt', 'no-show': 'Vắng' };
 
@@ -41,10 +42,7 @@ export function renderReception(root, user) {
             <input name="fullName" placeholder="Họ tên" required>
             <input name="dob" type="date" required>
             <select name="gender" required>
-              <option value="male">Nam</option>
-              <option value="female">Nữ</option>
-              <option value="other">Khác</option>
-              <option value="unknown">Không khai</option>
+              ${genderOptionsHtml()}
             </select>
             <input name="nationalId" placeholder="CCCD" required>
             <input name="medicalRecordNo" placeholder="Mã nội bộ (tùy chọn)">

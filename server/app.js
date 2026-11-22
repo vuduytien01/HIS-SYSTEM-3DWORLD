@@ -10,8 +10,8 @@ import {
 } from './auth.js';
 import { requireRole } from './rbac.js';
 import { recordEvent } from './events.js';
-import { dateKeyOf, dayBounds, issueQueueTicket } from './queue.js';
-import { parsePatientInput, findOrCreatePatient, publicPatient } from './patients.js';
+import { dateKeyOf, dayBounds, issueQueueTicket, retryOnTicketRace } from './queue.js';
+import { parsePatientInput, findOrCreatePatient, publicPatient, foldName } from './patients.js';
 
 const CLIENT_DIR = path.resolve(process.cwd(), 'client');
 
@@ -83,19 +83,20 @@ export function createApp({ vite = null, distDir = null } = {}) {
   }
 
   // Hai sự kiện check-in nằm cùng transaction với thay đổi state.
-  async function recordCheckInEvents(tx, { patientId, appointment, ticket, actor, from, reason }) {
-    const actorInfo = { actorType: 'user', actorUserId: actor.id, actorLabel: actor.displayName };
+  // Hai bảng từ vựng tách bạch: subjectStatus (vị trí bệnh nhân FHIR) và status của Appointment.
+  async function recordCheckInEvents(tx, { patientId, appointment, ticket, actor, reason }) {
+    const eventActor = { type: 'user', id: actor.id, label: actor.displayName };
     await recordEvent(tx, {
       type: 'patient.status.changed',
       aggregateId: patientId,
-      payload: { subjectStatus: 'arrived', appointmentId: appointment.id, from, to: 'checked-in' },
-      ...actorInfo,
+      payload: { subjectStatus: 'arrived', appointmentId: appointment.id, appointmentStatus: 'checked-in' },
+      actor: eventActor,
     });
     await recordEvent(tx, {
       type: 'queue.ticket.changed',
       aggregateId: ticket.id,
       payload: { ticketId: ticket.id, number: ticket.number, dateKey: ticket.dateKey, from: null, to: 'waiting', reason },
-      ...actorInfo,
+      actor: eventActor,
     });
   }
 
@@ -105,7 +106,13 @@ export function createApp({ vite = null, distDir = null } = {}) {
       const q = String(req.query.q ?? '').trim();
       if (q.length < 2) return res.json({ patients: [] });
       const patients = await prisma.patient.findMany({
-        where: { OR: [{ fullName: { contains: q } }, { phone: { contains: q } }] },
+        where: {
+          OR: [
+            { fullName: { contains: q } },
+            { searchName: { contains: foldName(q) } },
+            { phone: { contains: q } },
+          ],
+        },
         orderBy: { fullName: 'asc' },
         take: 20,
       });
@@ -150,7 +157,7 @@ export function createApp({ vite = null, distDir = null } = {}) {
     const actor = req.session.user;
     const now = new Date();
     try {
-      const result = await prisma.$transaction(async (tx) => {
+      const result = await retryOnTicketRace(() => prisma.$transaction(async (tx) => {
         const appointment = await tx.appointment.findUnique({ where: { id: req.params.id } });
         if (!appointment) throw httpError(404, 'Không tìm thấy hẹn');
         if (appointment.status === 'checked-in') throw httpError(409, 'Hẹn đã check-in');
@@ -166,15 +173,12 @@ export function createApp({ vite = null, distDir = null } = {}) {
           dateKey: dateKeyOf(now),
         });
         await recordCheckInEvents(tx, {
-          patientId: appointment.patientId, appointment, ticket, actor, from: 'booked', reason: 'check-in',
+          patientId: appointment.patientId, appointment, ticket, actor, reason: 'check-in',
         });
         return { appointment: publicAppointment(updated), ticket: publicTicket(ticket) };
-      });
+      }));
       res.json(result);
-    } catch (err) {
-      if (err.status) return res.status(err.status).json({ error: err.message });
-      next(err);
-    }
+    } catch (err) { next(err); }
   });
 
   // Walk-in tại quầy: Appointment checked-in một bước + cấp STT.
@@ -182,7 +186,7 @@ export function createApp({ vite = null, distDir = null } = {}) {
     const actor = req.session.user;
     const now = new Date();
     try {
-      const result = await prisma.$transaction(async (tx) => {
+      const result = await retryOnTicketRace(() => prisma.$transaction(async (tx) => {
         const patient = await tx.patient.findUnique({ where: { id: req.params.id } });
         if (!patient) throw httpError(404, 'Không tìm thấy bệnh nhân');
         const appointment = await tx.appointment.create({
@@ -194,18 +198,15 @@ export function createApp({ vite = null, distDir = null } = {}) {
           dateKey: dateKeyOf(now),
         });
         await recordCheckInEvents(tx, {
-          patientId: patient.id, appointment, ticket, actor, from: null, reason: 'walk-in',
+          patientId: patient.id, appointment, ticket, actor, reason: 'walk-in',
         });
         return {
           appointment: publicAppointment({ ...appointment, patient }),
           ticket: publicTicket(ticket),
         };
-      });
+      }));
       res.json(result);
-    } catch (err) {
-      if (err.status) return res.status(err.status).json({ error: err.message });
-      next(err);
-    }
+    } catch (err) { next(err); }
   });
 
   // Danh sách ngày hẹn và thẻ hàng đợi trong một ngày (mặc định hôm nay).
@@ -230,6 +231,15 @@ export function createApp({ vite = null, distDir = null } = {}) {
       });
       res.json({ tickets: tickets.map(publicTicket) });
     } catch (err) { next(err); }
+  });
+
+  // Lỗi nghiệp vụ mang status (httpError) — trả JSON thay vì trang HTML 500 mặc định của Express.
+  app.use((err, req, res, next) => {
+    if (err.status) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
+    next(err);
   });
 
   // Vite middleware phục vụ module JS/CSS khi dev — sau routes API, trước fallback SPA

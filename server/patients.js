@@ -1,6 +1,17 @@
 // Bệnh nhân: validation ở ranh giới API + khớp hồ sơ theo CCCD (định danh chính).
 const GENDERS = new Set(['male', 'female', 'other', 'unknown']);
 
+// Gấp tên về không dấu chữ thường — tìm kiếm tiếng Việt gõ không dấu vẫn khớp.
+export function foldName(name) {
+  return String(name ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D')
+    .toLowerCase()
+    .trim();
+}
+
 export function parsePatientInput(body = {}) {
   const fullName = String(body.fullName ?? '').trim();
   const dob = String(body.dob ?? '').trim();
@@ -19,6 +30,7 @@ export function parsePatientInput(body = {}) {
   return {
     data: {
       fullName,
+      searchName: foldName(fullName),
       dob: new Date(dob),
       gender,
       nationalId,

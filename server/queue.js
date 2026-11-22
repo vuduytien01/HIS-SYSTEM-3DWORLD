@@ -28,3 +28,18 @@ export async function issueQueueTicket(tx, { patientId, appointmentId, dateKey }
     },
   });
 }
+
+// Đua cấp số nổ unique [dateKey, number] (P2002): chạy lại transaction để đọc lại max,
+// không để lỗi 500 rơi cho bệnh nhân. Lỗi khác ném thẳng.
+export async function retryOnTicketRace(run, retries = 3) {
+  let last;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await run();
+    } catch (err) {
+      last = err;
+      if (err?.code !== 'P2002') throw err;
+    }
+  }
+  throw last;
+}

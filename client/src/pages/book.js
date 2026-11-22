@@ -1,5 +1,6 @@
 // Kênh web công cộng (/book): bệnh nhân đặt kế hoạch hẹn online — không cần đăng nhập.
 import { apiPublicBook } from '../api.js';
+import { genderOptionsHtml } from '../patient-fields.js';
 
 export function renderBook(root) {
   root.innerHTML = `
@@ -11,10 +12,7 @@ export function renderBook(root) {
         <label>Ngày sinh<input name="dob" type="date" required></label>
         <label>Giới tính
           <select name="gender" required>
-            <option value="male">Nam</option>
-            <option value="female">Nữ</option>
-            <option value="other">Khác</option>
-            <option value="unknown">Không khai</option>
+            ${genderOptionsHtml()}
           </select>
         </label>
         <label>CCCD<input name="nationalId" required></label>
