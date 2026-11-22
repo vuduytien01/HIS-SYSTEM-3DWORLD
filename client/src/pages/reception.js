@@ -6,6 +6,7 @@ import {
   apiUndoTicket, apiOverrideComplete, apiOverrideReasons,
   apiSetPriority, apiEmergencyLane, apiGroupAdmission,
 } from '../api.js';
+import { HospitalWorld } from '../world/world.js';
 import { ROLE_LABELS } from '../roles.js';
 import { GENDER_OPTIONS, genderOptionsHtml } from '../patient-fields.js';
 
@@ -38,7 +39,7 @@ export function renderReception(root, user) {
       <span class="user">${esc(user.displayName)} · ${ROLE_LABELS[user.role] ?? user.role}</span>
       <button id="logout">Đăng xuất</button>
     </header>
-    <main class="workspace two-col">
+    <main class="workspace three-col">
       <section class="panel">
         <h2>Tiếp nhận</h2>
         <input id="search" type="search" placeholder="Nhập vài chữ đầu tên hoặc số điện thoại…" autocomplete="off">
@@ -107,6 +108,14 @@ export function renderReception(root, user) {
           <tbody id="ticket-tbody"></tbody>
         </table>
         <button id="sweep" class="primary">Sweep cuối phiên — skipped chuyển no-show</button>
+      </section>
+      <section class="panel world-panel">
+        <h2>3D World quan sát</h2>
+        <div id="world-container" style="width:100%;height:400px;border:1px solid #e5e7eb;border-radius:8px;background:#f9fafb"></div>
+        <div class="world-controls" style="margin-top:8px">
+          <button id="world-reload" class="primary">Tải lại world</button>
+          <span class="muted" id="world-status">Đang tải...</span>
+        </div>
       </section>
     </main>
     <div id="toast" class="toast" hidden></div>
@@ -486,4 +495,51 @@ export function renderReception(root, user) {
   });
 
   refreshLists();
+
+  // Khởi tạo 3D World
+  let world = null;
+  async function initWorld() {
+    try {
+      const container = root.querySelector('#world-container');
+      const status = root.querySelector('#world-status');
+      if (!container) return;
+      status.textContent = 'Đang tải cấu hình phòng...';
+      const config = await apiRooms();
+      world = new HospitalWorld(container, connectSocket());
+      await world.buildWorld(config);
+      status.textContent = `Đã tải ${config.rooms.length} phòng`;
+      // Nút tải lại
+      root.querySelector('#world-reload').addEventListener('click', async () => {
+        const cfg = await apiRooms();
+        await world.buildWorld(cfg);
+        status.textContent = `Đã tải lại ${cfg.rooms.length} phòng`;
+      });
+    } catch (err) {
+      const status = root.querySelector('#world-status');
+      status.textContent = 'Lỗi: ' + err.message;
+    }
+  }
+
+  initWorld();
+
+  // Lắng nghe sự kiện room.state.changed từ socket để cập nhật world
+  const ws = connectSocket();
+  ws.on('config.changed', () => {
+    if (world) initWorld();
+  });
+  ws.on('room.state.changed', (payload) => {
+    if (world) world.updateRoom(payload);
+  });
+  ws.on('queue:snapshot', (snap) => {
+    if (world) world.applySnapshot(snap);
+  });
+  ws.on('call.issued', (payload) => {
+    if (world) world.handleCallIssued(payload);
+  });
+  ws.on('queue.ticket.changed', (payload) => {
+    if (world) {
+      // Cập nhật agent khi ticket đổi trạng thái
+      // world.applySnapshot sẽ được gọi qua queue:snapshot
+    }
+  });
 }
