@@ -5,6 +5,7 @@ const DEFAULTS = {
   parkedHoldMs: 3 * 60 * 1000,
   maxRecalls: 2,
   undoWindowMs: 60 * 1000,
+  noShowGraceMs: 15 * 60 * 1000,
 };
 
 // Trả về số; thiếu hoặc hỏng thì dùng mặc định hội đồng.

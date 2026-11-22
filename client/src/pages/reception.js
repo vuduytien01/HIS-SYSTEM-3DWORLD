@@ -19,6 +19,8 @@ function timeOf(iso) {
   return new Date(iso).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' });
 }
 
+let parkBadgeTimer = null;
+
 export function renderReception(root, user) {
   root.innerHTML = `
     <header class="topbar">
@@ -102,20 +104,29 @@ export function renderReception(root, user) {
       : '<tr><td colspan="4" class="muted">Chưa có hẹn nào trong ngày.</td></tr>';
   }
 
-  // Nút một cú bấm theo trạng thái (ticket 04): gọi / gọi lại / có mặt / tạm giữ / bỏ lượt / quay lại.
+  // Nút một cú bấm theo trạng thái (ticket 04): hành động + nhãn + API trong một bảng.
   const TICKET_ACTIONS = {
-    waiting: [['call', 'Gọi']],
-    called: [['recall', 'Gọi lại'], ['present', 'Có mặt'], ['park', 'Tạm giữ'], ['skip', 'Bỏ lượt']],
-    parked: [['recall', 'Gọi lại'], ['present', 'Có mặt'], ['skip', 'Bỏ lượt']],
-    skipped: [['rejoin', 'Quay lại']],
-    'no-show': [['rejoin', 'Quay lại']],
+    waiting: [{ act: 'call', label: 'Gọi', api: apiCallTicket }],
+    called: [
+      { act: 'recall', label: 'Gọi lại', api: apiRecallTicket },
+      { act: 'present', label: 'Có mặt', api: apiPresentTicket },
+      { act: 'park', label: 'Tạm giữ', api: (id) => apiParkTicket(id, null) },
+      { act: 'skip', label: 'Bỏ lượt', api: apiSkipTicket },
+    ],
+    parked: [
+      { act: 'recall', label: 'Gọi lại', api: apiRecallTicket },
+      { act: 'present', label: 'Có mặt', api: apiPresentTicket },
+      { act: 'skip', label: 'Bỏ lượt', api: apiSkipTicket },
+    ],
+    skipped: [{ act: 'rejoin', label: 'Quay lại', api: apiRejoinTicket }],
+    'no-show': [{ act: 'rejoin', label: 'Quay lại', api: apiRejoinTicket }],
   };
 
   function renderTickets(list) {
     $('#ticket-tbody').innerHTML = list.length
       ? list.map((t) => {
           const actions = (TICKET_ACTIONS[t.status] ?? [])
-            .map(([act, label]) => `<button class="primary" data-action="${act}" data-id="${esc(t.id)}">${label}</button>`)
+            .map((a) => `<button class="primary" data-action="${a.act}" data-id="${esc(t.id)}">${a.label}</button>`)
             .join(' ');
           const badge = t.status === 'parked' && t.parkedUntil
             ? `<span class="park-badge" data-until="${esc(t.parkedUntil)}">giữ đến ${timeOf(t.parkedUntil)}</span>`
@@ -202,15 +213,19 @@ export function renderReception(root, user) {
     }
   });
 
-  // Nút một cú bấm từ bảng: map action → API, server là thẩm quyền.
-  const ACTION_API = {
-    call: apiCallTicket,
-    recall: apiRecallTicket,
-    present: apiPresentTicket,
-    park: (id) => apiParkTicket(id, null),
-    skip: apiSkipTicket,
-    rejoin: apiRejoinTicket,
-  };
+  // Nút một cú bấm từ bảng: server là thẩm quyền, client chỉ chuyển tiếp.
+  $('#ticket-tbody').addEventListener('click', async (e) => {
+    const btn = e.target.closest('button[data-action]');
+    if (!btn) return;
+    const row = Object.values(TICKET_ACTIONS).flat().find((a) => a.act === btn.dataset.action);
+    try {
+      const res = await row.api(btn.dataset.id);
+      toast(`Số ${res.number}: ${QUEUE_STATUS_LABELS[res.status] ?? 'đã xử lý'}`);
+      await refreshLists();
+    } catch (err) {
+      setMsg(err.message, true);
+    }
+  });
 
   $('#sweep').addEventListener('click', async () => {
     try {
@@ -222,20 +237,9 @@ export function renderReception(root, user) {
     }
   });
 
-  $('#ticket-tbody').addEventListener('click', async (e) => {
-    const btn = e.target.closest('button[data-action]');
-    if (!btn) return;
-    try {
-      const res = await ACTION_API[btn.dataset.action](btn.dataset.id);
-      toast(`Số ${res.number}: ${QUEUE_STATUS_LABELS[res.status] ?? 'đã xử lý'}`);
-      await refreshLists();
-    } catch (err) {
-      setMsg(err.message, true);
-    }
-  });
-
-  // Badge đồng hồ tạm giữ đếm ngược mỗi giây cho lễ tân.
-  setInterval(() => {
+  // Badge đồng hồ tạm giữ đếm ngược mỗi giây; chỉ một interval sống trong phiên.
+  if (parkBadgeTimer) clearInterval(parkBadgeTimer);
+  parkBadgeTimer = setInterval(() => {
     root.querySelectorAll('.park-badge').forEach((el) => {
       const left = new Date(el.dataset.until).getTime() - Date.now();
       if (left <= 0) {

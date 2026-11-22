@@ -35,7 +35,7 @@ export function createIo(httpServer) {
     } else {
       const tickets = await prisma.queueTicket.findMany({
         where: { dateKey: dateKeyOf(new Date()) },
-        orderBy: { number: 'asc' },
+        orderBy: { lastQueuedAt: 'asc' },
       });
       socket.emit('queue:snapshot', tvSnapshot(tickets));
     }

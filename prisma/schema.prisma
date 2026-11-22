@@ -95,8 +95,10 @@ model QueueTicket {
   status        String    @default("waiting")
   callAttempts  Int       @default(0)
   parkedUntil   DateTime?
-  presencedAt   DateTime?
+  presenceAt    DateTime?
   skippedAt     DateTime?
+  // Trật tự hàng chờ thật: đặt khi phát số, cập nhật khi rejoin — người quay lại vào cuối hàng nhưng giữ số gốc
+  lastQueuedAt  DateTime  @default(now())
   issuedAt      DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 

@@ -60,6 +60,25 @@ export function createApp({ vite = null, distDir = null } = {}) {
     return err;
   }
 
+  // Chuyển trạng thái thẻ bằng CAS: guard trạng thái cho phép, updateMany có điều kiện,
+  // ghi sự kiện cùng transaction — hai màn hình bấm cùng lúc chỉ một thắng.
+  async function transitionTicket(tx, { id, allowed, data, reason, extra = {}, actor }) {
+    const current = await tx.queueTicket.findUnique({ where: { id } });
+    if (!current) throw httpError(404, 'Không tìm thấy thẻ hàng đợi');
+    if (!allowed.includes(current.status)) {
+      throw httpError(409, `Thẻ đang ở trạng thái ${current.status}, không thực hiện được thao tác này`);
+    }
+    const swapped = await tx.queueTicket.updateMany({ where: { id, status: current.status }, data });
+    if (swapped.count === 0) throw httpError(409, 'Thẻ vừa bị thao tác khác thay đổi');
+    await recordEvent(tx, {
+      type: 'queue.ticket.changed',
+      aggregateId: current.id,
+      payload: { ticketId: current.id, number: current.number, dateKey: current.dateKey, from: current.status, to: data.status, reason, ...extra },
+      actor,
+    });
+    return { ...current, ...data, reason };
+  }
+
   function publicAppointment(a) {
     return {
       id: a.id,
@@ -230,7 +249,7 @@ export function createApp({ vite = null, distDir = null } = {}) {
       const tickets = await prisma.queueTicket.findMany({
         where: { dateKey: String(req.query.dateKey ?? dateKeyOf(new Date())) },
         include: { patient: true },
-        orderBy: { number: 'asc' },
+        orderBy: { lastQueuedAt: 'asc' },
       });
       res.json({ tickets: tickets.map(publicTicket) });
     } catch (err) { next(err); }
@@ -245,28 +264,17 @@ export function createApp({ vite = null, distDir = null } = {}) {
       .emit('call.issued', publicTicketView(ticket));
   }
 
-  // Gọi số: waiting → called bằng cập nhật có điều kiện (compare-and-swap) — hai lễ tân bấm
-  // cùng số chỉ một người thắng; ghi sự kiện trong transaction rồi phát ba kênh một lần.
+  // Gọi số: waiting → called bằng CAS; ghi sự kiện trong transaction rồi phát ba kênh một lần.
   app.post('/api/tickets/:id/call', requireRole('RECEPTIONIST'), async (req, res, next) => {
-    const actor = req.session.user;
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
     try {
-      const ticket = await prisma.$transaction(async (tx) => {
-        const current = await tx.queueTicket.findUnique({ where: { id: req.params.id } });
-        if (!current) throw httpError(404, 'Không tìm thấy thẻ hàng đợi');
-        if (current.status !== 'waiting') throw httpError(409, `Thẻ đang ở trạng thái ${current.status}, không gọi được`);
-        const swapped = await tx.queueTicket.updateMany({
-          where: { id: current.id, status: 'waiting' },
-          data: { status: 'called', callAttempts: { increment: 1 } },
-        });
-        if (swapped.count === 0) throw httpError(409, 'Thẻ vừa được gọi bởi một thao tác khác');
-        await recordEvent(tx, {
-          type: 'queue.ticket.changed',
-          aggregateId: current.id,
-          payload: { ticketId: current.id, number: current.number, dateKey: current.dateKey, from: 'waiting', to: 'called', reason: 'call', callAttempts: current.callAttempts + 1 },
-          actor: { type: 'user', id: actor.id, label: actor.displayName },
-        });
-        return { ...current, status: 'called', callAttempts: current.callAttempts + 1 };
-      });
+      const ticket = await prisma.$transaction((tx) => transitionTicket(tx, {
+        id: req.params.id,
+        allowed: ['waiting'],
+        data: { status: 'called', callAttempts: { increment: 1 } },
+        reason: 'call',
+        actor,
+      }));
       broadcastCall(req.app.get('io'), ticket);
       res.json(publicTicketView(ticket));
     } catch (err) { next(err); }
@@ -277,7 +285,7 @@ export function createApp({ vite = null, distDir = null } = {}) {
     try {
       const tickets = await prisma.queueTicket.findMany({
         where: { dateKey: dateKeyOf(new Date()) },
-        orderBy: { number: 'asc' },
+        orderBy: { lastQueuedAt: 'asc' },
       });
       res.json(tvSnapshot(tickets));
     } catch (err) { next(err); }
@@ -296,58 +304,41 @@ export function createApp({ vite = null, distDir = null } = {}) {
 
   // Tạm giữ sau khi gọi: parkUntil bắt buộc — client chỉ định hoặc server tính theo cấu hình.
   app.post('/api/tickets/:id/park', requireRole('RECEPTIONIST'), async (req, res, next) => {
-    const actor = req.session.user;
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
     const holdMs = await getConfigParam('parkedHoldMs');
     const parkedUntil = req.body?.parkedUntil ? new Date(String(req.body.parkedUntil)) : new Date(Date.now() + holdMs);
     if (Number.isNaN(parkedUntil.getTime())) return res.status(400).json({ error: 'parkedUntil không hợp lệ' });
     try {
-      const ticket = await prisma.$transaction(async (tx) => {
-        const current = await tx.queueTicket.findUnique({ where: { id: req.params.id } });
-        if (!current) throw httpError(404, 'Không tìm thấy thẻ hàng đợi');
-        if (current.status !== 'called') throw httpError(409, `Chỉ thẻ đang gọi mới tạm giữ được (hiện ${current.status})`);
-        const swapped = await tx.queueTicket.updateMany({
-          where: { id: current.id, status: 'called' },
-          data: { status: 'parked', parkedUntil },
-        });
-        if (swapped.count === 0) throw httpError(409, 'Thẻ vừa bị thao tác khác thay đổi');
-        await recordEvent(tx, {
-          type: 'queue.ticket.changed',
-          aggregateId: current.id,
-          payload: { ticketId: current.id, number: current.number, dateKey: current.dateKey, from: 'called', to: 'parked', reason: 'park', parkedUntil: parkedUntil.toISOString() },
-          actor: { type: 'user', id: actor.id, label: actor.displayName },
-        });
-        return { ...current, status: 'parked', parkedUntil };
-      });
+      const ticket = await prisma.$transaction((tx) => transitionTicket(tx, {
+        id: req.params.id,
+        allowed: ['called'],
+        data: { status: 'parked', parkedUntil },
+        reason: 'park',
+        extra: { parkedUntil: parkedUntil.toISOString() },
+        actor,
+      }));
       res.json({ ...publicTicketView(ticket), status: 'parked', parkedUntil: ticket.parkedUntil });
     } catch (err) { next(err); }
   });
 
   // Gọi lại: phát lại call.issued cho thẻ called/parked; tối đa maxRecalls lần gọi lại theo cấu hình.
   app.post('/api/tickets/:id/recall', requireRole('RECEPTIONIST'), async (req, res, next) => {
-    const actor = req.session.user;
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
     const maxRecalls = await getConfigParam('maxRecalls');
     try {
       const ticket = await prisma.$transaction(async (tx) => {
         const current = await tx.queueTicket.findUnique({ where: { id: req.params.id } });
         if (!current) throw httpError(404, 'Không tìm thấy thẻ hàng đợi');
-        if (current.status !== 'called' && current.status !== 'parked') {
-          throw httpError(409, `Thẻ đang ở trạng thái ${current.status}, không gọi lại được`);
-        }
         if (current.callAttempts - 1 >= maxRecalls) {
           throw httpError(409, `Đã gọi lại đủ ${maxRecalls} lần theo cấu hình`);
         }
-        const swapped = await tx.queueTicket.updateMany({
-          where: { id: current.id, status: current.status },
+        return transitionTicket(tx, {
+          id: req.params.id,
+          allowed: ['called', 'parked'],
           data: { status: 'called', callAttempts: { increment: 1 }, parkedUntil: null },
+          reason: 'recall',
+          actor,
         });
-        if (swapped.count === 0) throw httpError(409, 'Thẻ vừa bị thao tác khác thay đổi');
-        await recordEvent(tx, {
-          type: 'queue.ticket.changed',
-          aggregateId: current.id,
-          payload: { ticketId: current.id, number: current.number, dateKey: current.dateKey, from: current.status, to: 'called', reason: 'recall', callAttempts: current.callAttempts + 1 },
-          actor: { type: 'user', id: actor.id, label: actor.displayName },
-        });
-        return { ...current, status: 'called', callAttempts: current.callAttempts + 1, parkedUntil: null };
       });
       broadcastCall(req.app.get('io'), ticket);
       res.json(publicTicketView(ticket));
@@ -356,85 +347,56 @@ export function createApp({ vite = null, distDir = null } = {}) {
 
   // Xác nhận có mặt từ quầy/lễ tân — cùng presence marker với kênh web.
   app.post('/api/tickets/:id/present', requireRole('RECEPTIONIST'), async (req, res, next) => {
-    const actor = req.session.user;
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
+    const now = new Date();
     try {
-      const ticket = await prisma.$transaction(async (tx) => {
-        const current = await tx.queueTicket.findUnique({ where: { id: req.params.id } });
-        if (!current) throw httpError(404, 'Không tìm thấy thẻ hàng đợi');
-        if (current.status !== 'called' && current.status !== 'parked') {
-          throw httpError(409, `Thẻ đang ở trạng thái ${current.status}, không ghi có mặt được`);
-        }
-        const swapped = await tx.queueTicket.updateMany({
-          where: { id: current.id, status: current.status },
-          data: { status: 'present', presencedAt: new Date() },
-        });
-        if (swapped.count === 0) throw httpError(409, 'Thẻ vừa bị thao tác khác thay đổi');
-        await recordEvent(tx, {
-          type: 'queue.ticket.changed',
-          aggregateId: current.id,
-          payload: { ticketId: current.id, number: current.number, dateKey: current.dateKey, from: current.status, to: 'present', reason: 'present-desk' },
-          actor: { type: 'user', id: actor.id, label: actor.displayName },
-        });
-        return { ...current, status: 'present', presencedAt: new Date() };
-      });
+      const ticket = await prisma.$transaction((tx) => transitionTicket(tx, {
+        id: req.params.id,
+        allowed: ['called', 'parked'],
+        data: { status: 'present', presenceAt: now },
+        reason: 'present-desk',
+        actor,
+      }));
       res.json({ ...publicTicketView(ticket), status: 'present' });
     } catch (err) { next(err); }
   });
 
   // Bỏ lượt: thẻ đang chờ/gọi/tạm giữ → skipped (khôi phục được), skippedAt làm mốc cửa sổ undo.
   app.post('/api/tickets/:id/skip', requireRole('RECEPTIONIST'), async (req, res, next) => {
-    const actor = req.session.user;
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
+    const now = new Date();
     try {
-      const ticket = await prisma.$transaction(async (tx) => {
-        const current = await tx.queueTicket.findUnique({ where: { id: req.params.id } });
-        if (!current) throw httpError(404, 'Không tìm thấy thẻ hàng đợi');
-        if (!['waiting', 'called', 'parked'].includes(current.status)) {
-          throw httpError(409, `Thẻ đang ở trạng thái ${current.status}, không bỏ lượt được`);
-        }
-        const swapped = await tx.queueTicket.updateMany({
-          where: { id: current.id, status: current.status },
-          data: { status: 'skipped', skippedAt: new Date() },
-        });
-        if (swapped.count === 0) throw httpError(409, 'Thẻ vừa bị thao tác khác thay đổi');
-        await recordEvent(tx, {
-          type: 'queue.ticket.changed',
-          aggregateId: current.id,
-          payload: { ticketId: current.id, number: current.number, dateKey: current.dateKey, from: current.status, to: 'skipped', reason: 'skip' },
-          actor: { type: 'user', id: actor.id, label: actor.displayName },
-        });
-        return { ...current, status: 'skipped', skippedAt: new Date() };
-      });
+      const ticket = await prisma.$transaction((tx) => transitionTicket(tx, {
+        id: req.params.id,
+        allowed: ['waiting', 'called', 'parked'],
+        data: { status: 'skipped', skippedAt: now },
+        reason: 'skip',
+        actor,
+      }));
       res.json({ ...publicTicketView(ticket), status: 'skipped' });
     } catch (err) { next(err); }
   });
 
   // Khôi phục sau bỏ lượt/vắng mặt: trong cửa sổ undo là hoàn tác (reason 'undo'),
-  // ngoài cửa sổ hoặc từ no-show là thao tác có chủ đích (reason 'restore'/'rejoin'). Số gốc giữ nguyên.
+  // ngoài cửa sổ hoặc từ no-show là thao tác có chủ đích (reason 'restore'/'rejoin').
+  // Giữ số gốc, xếp vào cuối hàng (lastQueuedAt = now), reset chu kỳ gọi (callAttempts về 0).
   app.post('/api/tickets/:id/rejoin', requireRole('RECEPTIONIST'), async (req, res, next) => {
-    const actor = req.session.user;
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
     const undoMs = await getConfigParam('undoWindowMs');
     try {
       const ticket = await prisma.$transaction(async (tx) => {
         const current = await tx.queueTicket.findUnique({ where: { id: req.params.id } });
         if (!current) throw httpError(404, 'Không tìm thấy thẻ hàng đợi');
-        if (current.status !== 'skipped' && current.status !== 'no-show') {
-          throw httpError(409, `Thẻ đang ở trạng thái ${current.status}, không khôi phục được`);
-        }
         const inUndoWindow = current.status === 'skipped' && current.skippedAt
           && Date.now() - new Date(current.skippedAt).getTime() <= undoMs;
         const reason = inUndoWindow ? 'undo' : (current.status === 'skipped' ? 'restore' : 'rejoin');
-        const swapped = await tx.queueTicket.updateMany({
-          where: { id: current.id, status: current.status },
-          data: { status: 'waiting', skippedAt: null, parkedUntil: null },
+        return transitionTicket(tx, {
+          id: req.params.id,
+          allowed: ['skipped', 'no-show'],
+          data: { status: 'waiting', skippedAt: null, parkedUntil: null, callAttempts: 0, lastQueuedAt: new Date() },
+          reason,
+          actor,
         });
-        if (swapped.count === 0) throw httpError(409, 'Thẻ vừa bị thao tác khác thay đổi');
-        await recordEvent(tx, {
-          type: 'queue.ticket.changed',
-          aggregateId: current.id,
-          payload: { ticketId: current.id, number: current.number, dateKey: current.dateKey, from: current.status, to: 'waiting', reason },
-          actor: { type: 'user', id: actor.id, label: actor.displayName },
-        });
-        return { ...current, status: 'waiting', reason };
       });
       res.json({ ...publicTicketView(ticket), status: 'waiting', reason: ticket.reason });
     } catch (err) { next(err); }
@@ -442,46 +404,50 @@ export function createApp({ vite = null, distDir = null } = {}) {
 
   // Kênh web bệnh nhân xác nhận có mặt bằng mã theo dõi — cùng presence marker, actor là patient-web.
   app.post('/api/public/track/:code/confirm', async (req, res, next) => {
+    const now = new Date();
     try {
       const ticket = await prisma.$transaction(async (tx) => {
-        const current = await tx.queueTicket.findUnique({ where: { trackingCode: String(req.params.code) } });
-        if (!current) throw httpError(404, 'Mã theo dõi không đúng');
-        if (current.status !== 'called' && current.status !== 'parked') {
-          throw httpError(409, `Thẻ đang ở trạng thái ${current.status}, không xác nhận có mặt được`);
-        }
-        const swapped = await tx.queueTicket.updateMany({
-          where: { id: current.id, status: current.status },
-          data: { status: 'present', presencedAt: new Date() },
-        });
-        if (swapped.count === 0) throw httpError(409, 'Thẻ vừa bị thao tác khác thay đổi');
-        await recordEvent(tx, {
-          type: 'queue.ticket.changed',
-          aggregateId: current.id,
-          payload: { ticketId: current.id, number: current.number, dateKey: current.dateKey, from: current.status, to: 'present', reason: 'present-web' },
+        const target = await tx.queueTicket.findUnique({ where: { trackingCode: String(req.params.code) } });
+        if (!target) throw httpError(404, 'Mã theo dõi không đúng');
+        return transitionTicket(tx, {
+          id: target.id,
+          allowed: ['called', 'parked'],
+          data: { status: 'present', presenceAt: now },
+          reason: 'present-web',
           actor: { type: 'patient-web', id: null, label: 'Bệnh nhân qua mã theo dõi' },
         });
-        return { ...current, status: 'present', presencedAt: new Date() };
       });
       res.json(trackSnapshot(ticket));
     } catch (err) { next(err); }
   });
 
-  // Sweep cuối phiên: mọi thẻ skipped của hôm nay → no-show. Không đường tay nào chốt no-show trực tiếp.
+  // Sweep cuối phiên: thẻ skipped quá hạn (noShowGraceMs theo cấu hình) → no-show, CAS từng thẻ.
+  // Không đường tay nào chốt no-show trực tiếp.
   app.post('/api/sweep', requireRole('RECEPTIONIST'), async (req, res, next) => {
-    const actor = req.session.user;
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
     try {
       const moved = await prisma.$transaction(async (tx) => {
-        const targets = await tx.queueTicket.findMany({ where: { dateKey: dateKeyOf(new Date()), status: 'skipped' } });
+        const graceMs = await getConfigParam('noShowGraceMs');
+        const cutoff = new Date(Date.now() - graceMs);
+        const targets = await tx.queueTicket.findMany({
+          where: { dateKey: dateKeyOf(new Date()), status: 'skipped', skippedAt: { lt: cutoff } },
+        });
+        let count = 0;
         for (const target of targets) {
-          await tx.queueTicket.update({ where: { id: target.id }, data: { status: 'no-show' } });
+          const swapped = await tx.queueTicket.updateMany({
+            where: { id: target.id, status: 'skipped' },
+            data: { status: 'no-show' },
+          });
+          if (swapped.count === 0) continue;
           await recordEvent(tx, {
             type: 'queue.ticket.changed',
             aggregateId: target.id,
             payload: { ticketId: target.id, number: target.number, dateKey: target.dateKey, from: 'skipped', to: 'no-show', reason: 'sweep' },
-            actor: { type: 'user', id: actor.id, label: actor.displayName },
+            actor,
           });
+          count++;
         }
-        return targets.length;
+        return count;
       });
       res.json({ moved });
     } catch (err) { next(err); }

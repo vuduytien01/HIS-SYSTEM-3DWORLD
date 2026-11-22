@@ -112,6 +112,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  await prisma.config.deleteMany();
   await prisma.$disconnect();
   await new Promise((resolve) => server.close(resolve));
 });
@@ -341,6 +342,8 @@ test('mặt công cộng zero-PII: không tên, CCCD, BHYT, SĐT; mã sai trả 
 });
 
 test('giao thức vắng mặt: park → gọi lại ×2 → từ chối lần 3 → skip → undo → sweep no-show → rejoin giữ số', async () => {
+  // Sweep chỉ chốt skipped quá hạn — test đặt grace 0 để thẻ vừa skip chuyển được ngay qua sweep.
+  await prisma.config.create({ data: { key: 'noShowGraceMs', value: '0' } });
   const created = await api('/api/patients', { method: 'POST', cookie: receptionistCookie, body: patientPayload('Trương Vắng Mặt') });
   const { patient } = await created.json();
   const check = await api(`/api/patients/${patient.id}/check-in`, { method: 'POST', cookie: receptionistCookie });
@@ -386,6 +389,13 @@ test('giao thức vắng mặt: park → gọi lại ×2 → từ chối lần 3
   const r2 = await rejoin2.json();
   expect(r2.reason).toBe('rejoin');
   expect(r2.number).toBe(ticket.number);
+
+  // Xếp cuối hàng: thẻ rejoin đứng cuối trong các thẻ đang waiting, dù số gốc nhỏ hơn các thẻ khác.
+  const list = await (await api('/api/tickets', { cookie: receptionistCookie })).json();
+  const waiting = list.tickets.filter((t) => t.status === 'waiting');
+  expect(waiting[waiting.length - 1].number).toBe(ticket.number);
+
+  await prisma.config.deleteMany();
 });
 
 test('xác nhận có mặt từ web và từ quầy ghi cùng marker với actor khác nhau', async () => {
