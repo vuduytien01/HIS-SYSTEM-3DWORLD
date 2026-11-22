@@ -4,6 +4,7 @@ import {
   apiCallTicket, apiParkTicket, apiRecallTicket, apiPresentTicket, apiSkipTicket, apiRejoinTicket, apiSweep,
   apiRooms, apiSuggestRooms, apiAssignTicket, apiAdmitTicket,
   apiUndoTicket, apiOverrideComplete, apiOverrideReasons,
+  apiSetPriority, apiEmergencyLane, apiGroupAdmission,
 } from '../api.js';
 import { ROLE_LABELS } from '../roles.js';
 import { GENDER_OPTIONS, genderOptionsHtml } from '../patient-fields.js';
@@ -11,6 +12,13 @@ import { GENDER_OPTIONS, genderOptionsHtml } from '../patient-fields.js';
 const GENDER_LABELS = Object.fromEntries(GENDER_OPTIONS.map((g) => [g.value, g.label]));
 const APPT_STATUS_LABELS = { booked: 'Đã đặt', 'checked-in': 'Đã tiếp nhận', cancelled: 'Đã hủy' };
 const QUEUE_STATUS_LABELS = { waiting: 'Chờ gọi', called: 'Đã gọi', present: 'Có mặt', parked: 'Tạm giữ', skipped: 'Bỏ lượt', 'no-show': 'Vắng' };
+const PRIORITY_LABELS = { emergency: 'Cấp cứu', urgent: 'Khẩn cấp', asap: 'Sớm', routine: 'Thường' };
+const PRIORITY_GROUPS = {
+  emergency: ['elderly', 'disability', 'pregnant', 'emergency-light'],
+  urgent: [],
+  asap: [],
+  routine: [],
+};
 
 // Mọi chuỗi từ API được escape trước khi vào innerHTML — dữ liệu người dùng không được tin.
 function esc(s) {
@@ -40,6 +48,27 @@ export function renderReception(root, user) {
           <p id="sel-info" class="muted"></p>
           <p id="sel-appt" class="badge-line"></p>
           <button id="checkin" class="primary">Tiếp nhận</button>
+          <div id="priority-controls" hidden>
+            <label>Ưu tiên
+              <select id="priority-select">
+                <option value="routine">Thường</option>
+                <option value="asap">Sớm</option>
+                <option value="urgent">Khẩn cấp</option>
+                <option value="emergency">Cấp cứu</option>
+              </select>
+            </label>
+            <label>Nhóm QĐ 1313
+              <select id="priority-group-select">
+                <option value="">Không nhóm</option>
+                <option value="elderly">Cao tuổi</option>
+                <option value="disability">Khuyết tật</option>
+                <option value="pregnant">Thai phụ</option>
+                <option value="emergency-light">Cấp cứu nhẹ</option>
+              </select>
+            </label>
+            <button id="set-priority" class="primary">Cập nhật ưu tiên</button>
+            <button id="emergency-lane" class="primary" style="background:#b91c1c;margin-left:8px">Làn cấp cứu</button>
+          </div>
         </div>
         <details class="new-patient">
           <summary>Đăng ký hồ sơ mới</summary>
@@ -54,6 +83,14 @@ export function renderReception(root, user) {
             <input name="insuranceNo" placeholder="BHYT (tùy chọn)">
             <input name="phone" placeholder="Số điện thoại" required>
             <button class="primary">Lưu hồ sơ</button>
+          </form>
+        </details>
+        <details class="new-patient">
+          <summary>Tiếp nhận đoàn (khám sức khỏe hợp đồng)</summary>
+          <form id="group-form">
+            <textarea id="group-patients" placeholder="Danh sách bệnh nhân, mỗi dòng: Họ tên|Ngày sinh|Giới tính|CCCD|SĐT" rows="6" style="width:100%;font-family:monospace;padding:8px;border:1px solid #d1d5db;border-radius:6px" required></textarea>
+            <div class="muted" style="font-size:12px;margin:4px 0">Định dạng: Nguyễn Văn A|1990-01-01|male|C123456789|0901234567</div>
+            <button class="primary">Tiếp nhận đoàn</button>
           </form>
         </details>
         <p id="flow-msg"></p>
@@ -125,6 +162,10 @@ export function renderReception(root, user) {
       { act: 'undo', label: 'Hoàn tác', api: (id) => apiUndoTicket(id, '') },
       { act: 'override', label: 'Override đóng', api: (id) => apiOverrideComplete(id, '') },
     ],
+    'in-progress': [
+      { act: 'undo', label: 'Hoàn tác', api: (id) => apiUndoTicket(id, '') },
+      { act: 'override', label: 'Override đóng', api: (id) => apiOverrideComplete(id, '') },
+    ],
     skipped: [{ act: 'rejoin', label: 'Quay lại', api: apiRejoinTicket }],
     'no-show': [{ act: 'rejoin', label: 'Quay lại', api: apiRejoinTicket }],
   };
@@ -155,10 +196,12 @@ export function renderReception(root, user) {
                  <button class="primary" data-assign-go="${esc(t.id)}">Xếp</button>`
               : '<span class="muted">Không còn phòng trống</span>';
           }
+          // Hiển thị groupId nếu là đoàn.
+          const groupBadge = t.groupId ? `<span class="group-badge" style="background:#e0e7ff;color:#3730a3;padding:2px 6px;border-radius:999px;font-size:11px;margin-left:6px">${esc(t.groupId)}</span>` : '';
           return `<tr>
             <td>${t.number}</td>
             <td>${timeOf(t.issuedAt)}</td>
-            <td>${esc(t.patient?.fullName ?? '')}</td>
+            <td>${esc(t.patient?.fullName ?? '')} ${groupBadge}</td>
             <td>${esc(QUEUE_STATUS_LABELS[t.status] ?? t.status)} ${badge}</td>
             <td>${actions}</td>
             <td>${roomCell}</td>
@@ -181,6 +224,7 @@ export function renderReception(root, user) {
     selected = null;
     bookedAppointment = null;
     $('#selected').hidden = true;
+    updatePriorityControls();
   }
 
   function selectPatient(p) {
@@ -193,6 +237,7 @@ export function renderReception(root, user) {
     $('#sel-appt').textContent = bookedAppointment
       ? `Có hẹn hôm nay ${timeOf(bookedAppointment.scheduledFor)} — một cú bấm tiếp nhận`
       : 'Không có hẹn hôm nay — tiếp nhận walk-in';
+    updatePriorityControls();
   }
 
   let searchTimer;
@@ -241,7 +286,64 @@ export function renderReception(root, user) {
     }
   });
 
-  // Nút một cú bấm từ bảng: server là thẩm quyền, client chỉ chuyển tiếp.
+  // Cập nhật ưu tiên + nhóm QĐ 1313.
+  $('#set-priority').addEventListener('click', async () => {
+    if (!selected) return;
+    try {
+      const res = await apiSetPriority(selected.id, $('#priority-select').value, $('#priority-group-select').value || null);
+      toast(`Đã cập nhật ưu tiên: ${PRIORITY_LABELS[res.priority]}`);
+      await refreshLists();
+    } catch (err) {
+      setMsg(err.message, true);
+    }
+  });
+
+  // Làn cấp cứu một cú bấm.
+  $('#emergency-lane').addEventListener('click', async () => {
+    if (!selected) return;
+    if (!confirm('Mở làn cấp cứu cho bệnh nhân này? Sẽ đóng mọi hàng chờ cũ.')) return;
+    try {
+      const res = await apiEmergencyLane(selected.id);
+      toast(`Đã mở làn cấp cứu, ticket mới STT ${res.newTicket.number}`);
+      clearSelection();
+      $('#results').innerHTML = '';
+      $('#search').value = '';
+      await refreshLists();
+    } catch (err) {
+      setMsg(err.message, true);
+    }
+  });
+
+  // Tiếp nhận đoàn.
+  $('#group-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const text = root.querySelector('#group-patients').value.trim();
+    if (!text) return;
+    const lines = text.split('\n').filter((l) => l.trim());
+    const patients = lines.map((line) => {
+      const [fullName, dob, gender, nationalId, phone] = line.split('|').map((s) => s.trim());
+      return { fullName, dob, gender, nationalId, phone };
+    });
+    try {
+      const res = await apiGroupAdmission(patients);
+      toast(`Đã tiếp nhận đoàn ${res.groupId}: ${res.tickets.length} bệnh nhân`);
+      e.target.reset();
+      await refreshLists();
+    } catch (err) {
+      setMsg(err.message, true);
+    }
+  });
+
+  // Hiển thị controls ưu tiên khi chọn bệnh nhân có visit present/in-progress.
+  const updatePriorityControls = () => {
+    const el = root.querySelector('#priority-controls');
+    if (!el) return;
+    if (selected && selected.visit && (selected.visit.status === 'present' || selected.visit.status === 'in-progress')) {
+      el.hidden = false;
+    } else {
+      el.hidden = true;
+    }
+  };
   let overrideReasons = [];
 
   async function loadOverrideReasons() {

@@ -780,3 +780,64 @@ test('Provenance: mọi undo/override ghi actor, timestamp server, thao tác, l�
   expect(event.actorLabel).toBe('Lễ tân test');
   expect(Math.abs(Date.now() - new Date(event.occurredAt).getTime())).toBeLessThan(60_000);
 });
+
+test('cập nhật ưu tiên + nhóm QĐ 1313, mặt công cộng chỉ hiện "ưu tiên: có"', async () => {
+  const mk = await api('/api/patients', { method: 'POST', cookie: receptionistCookie, body: patientPayload('Đậu Ưu Tiên') });
+  const { patient } = await mk.json();
+  const check = await api(`/api/patients/${patient.id}/check-in`, { method: 'POST', cookie: receptionistCookie });
+  const { ticket } = await check.json();
+
+  const setP = await api(`/api/tickets/${ticket.id}/priority`, { method: 'POST', cookie: receptionistCookie, body: { priority: 'urgent', group: 'elderly' } });
+  expect(setP.status).toBe(200);
+  expect((await setP.json()).priority).toBe('urgent');
+
+  // Mặt công cộng chỉ hiện priority true/false, không nhóm cụ thể.
+  const track = await (await api(`/api/public/track/${ticket.trackingCode}`)).json();
+  expect(track.priority).toBe(true);
+  expect(track.priorityGroup).toBeUndefined();
+});
+
+test('làn cấp cứu: đóng mọi hàng chờ cũ, mở ticket mới priority emergency', async () => {
+  const mk = await api('/api/patients', { method: 'POST', cookie: receptionistCookie, body: patientPayload('Đậu Cấp Cứu') });
+  const { patient } = await mk.json();
+  const check = await api(`/api/patients/${patient.id}/check-in`, { method: 'POST', cookie: receptionistCookie });
+  const { ticket } = await check.json();
+  await api(`/api/tickets/${ticket.id}/call`, { method: 'POST', cookie: receptionistCookie });
+  await api(`/api/tickets/${ticket.id}/present`, { method: 'POST', cookie: receptionistCookie });
+
+  const { rooms } = await (await api('/api/rooms', { cookie: receptionistCookie })).json();
+  const p01 = rooms.find((r) => r.code === 'P01');
+  const assign = await api(`/api/tickets/${ticket.id}/assign`, { method: 'POST', cookie: receptionistCookie, body: { roomId: p01.id } });
+  await api(`/api/tickets/${ticket.id}/admit`, { method: 'POST', cookie: receptionistCookie });
+
+  const emergency = await api(`/api/tickets/${ticket.id}/emergency`, { method: 'POST', cookie: receptionistCookie });
+  expect(emergency.status).toBe(200);
+  const res = await emergency.json();
+  expect(res.newTicket.priority).toBe('emergency');
+  expect(res.oldTicket.priority).toBe('emergency');
+
+  // Ticket cũ cancelled, phòng free.
+  const oldT = await prisma.queueTicket.findUnique({ where: { id: ticket.id } });
+  expect(oldT.status).toBe('cancelled');
+  const room = await prisma.room.findUnique({ where: { id: p01.id } });
+  expect(room.state).toBe('free');
+});
+
+test('tiếp nhận đoàn: một thao tác tạo N ticket groupId chung, STT liền nhau', async () => {
+  const patients = [
+    { fullName: 'Đoàn A1', dob: '1990-01-01', gender: 'male', nationalId: 'C' + randomUUID().replaceAll('-', '').slice(0, 11), phone: '0900000001' },
+    { fullName: 'Đoàn A2', dob: '1990-02-02', gender: 'female', nationalId: 'C' + randomUUID().replaceAll('-', '').slice(0, 11), phone: '0900000002' },
+    { fullName: 'Đoàn A3', dob: '1990-03-03', gender: 'male', nationalId: 'C' + randomUUID().replaceAll('-', '').slice(0, 11), phone: '0900000003' },
+  ];
+  const group = await api('/api/group-admission', { method: 'POST', cookie: receptionistCookie, body: { patients } });
+  expect(group.status).toBe(200);
+  const res = await group.json();
+  expect(res.tickets.length).toBe(3);
+  expect(res.tickets.every((t) => t.ticket.groupId === res.groupId)).toBe(true);
+  expect(res.tickets.map((t) => t.ticket.number)).toEqual([res.tickets[0].ticket.number, res.tickets[0].ticket.number + 1, res.tickets[0].ticket.number + 2]);
+  expect(res.tickets.every((t) => t.ticket.groupId === res.groupId)).toBe(true);
+  // UI hiển thị group badge.
+  const list = await (await api('/api/tickets', { cookie: receptionistCookie })).json();
+  const groupTickets = list.tickets.filter((t) => t.groupId === res.groupId);
+  expect(groupTickets.length).toBe(3);
+});

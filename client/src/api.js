@@ -67,6 +67,14 @@ export const apiOverrideComplete = (id, reason) =>
   fetchJson(`/api/tickets/${encodeURIComponent(id)}/override-complete`, { method: 'POST', body: JSON.stringify({ reason }) });
 export const apiOverrideReasons = () => fetchJson('/api/config/override-reasons');
 
+// ---- Ticket 07: Nhóm ưu tiên + Làn cấp cứu + Đoàn ----
+export const apiSetPriority = (id, priority, group) =>
+  fetchJson(`/api/tickets/${encodeURIComponent(id)}/priority`, { method: 'POST', body: JSON.stringify({ priority, group }) });
+export const apiEmergencyLane = (id) =>
+  fetchJson(`/api/tickets/${encodeURIComponent(id)}/emergency`, { method: 'POST' });
+export const apiGroupAdmission = (patients) =>
+  fetchJson('/api/group-admission', { method: 'POST', body: JSON.stringify({ patients }) });
+
 export function connectSocket(options = {}) {
   return io({ withCredentials: true, ...options });
 }

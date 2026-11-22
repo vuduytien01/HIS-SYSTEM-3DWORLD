@@ -846,6 +846,132 @@ export function createApp({ vite = null, distDir = null } = {}) {
     } catch (err) { next(err); }
   });
 
+  // ---- Ticket 07: Nhóm ưu tiên + Làn cấp cứu + Đoàn bệnh nhân ----
+
+  const PRIORITY_GROUPS = {
+    emergency: ['elderly', 'disability', 'pregnant', 'emergency-light'],
+    urgent: [],
+    asap: [],
+    routine: [],
+  };
+
+  // Cập nhật ưu tiên: toggle hoặc set nhóm QĐ 1313, set Appointment.priority tương ứng.
+  app.post('/api/tickets/:id/priority', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
+    const { priority, group } = req.body ?? {};
+    if (!priority || !['emergency', 'urgent', 'asap', 'routine'].includes(priority)) {
+      return res.status(400).json({ error: 'priority không hợp lệ' });
+    }
+    try {
+      const ticket = await prisma.$transaction(async (tx) => {
+        const current = await tx.queueTicket.findUnique({ where: { id: req.params.id } });
+        if (!current) throw httpError(404, 'Không tìm thấy thẻ hàng đợi');
+        const updated = await tx.queueTicket.update({ where: { id: current.id }, data: { priority, groupId: group ?? current.groupId } });
+        await recordEvent(tx, {
+          type: 'queue.ticket.changed',
+          aggregateId: current.id,
+          payload: { ticketId: current.id, number: current.number, dateKey: current.dateKey, from: current.priority, to: priority, group },
+          actor,
+        });
+        // Cập nhật Appointment.priority (ActPriority v3) nếu có.
+        if (current.appointmentId) {
+          await tx.appointment.update({ where: { id: current.appointmentId }, data: { priority } });
+        }
+        return { ...updated, priority };
+      });
+      res.json({ ticket: ticket, priority });
+    } catch (err) { next(err); }
+  });
+
+  // Làn cấp cứu: một transaction đóng mọi hàng chờ cũ, mở lượt mới.
+  app.post('/api/tickets/:id/emergency', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
+    const now = new Date();
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        const ticket = await tx.queueTicket.findUnique({ where: { id: req.params.id }, include: { visit: true, appointment: true } });
+        if (!ticket) throw httpError(404, 'Không tìm thấy thẻ hàng đợi');
+        // Đóng mọi ticket khác của cùng bệnh nhân (kể cả called/parked) về waiting hoặc cancelled.
+        await tx.queueTicket.updateMany({
+          where: { patientId: ticket.patientId, id: { not: ticket.id }, status: { in: ['waiting', 'called', 'parked'] } },
+          data: { status: 'cancelled' },
+        });
+        // Nếu đang có visit: cancel visit, room free.
+        if (ticket.visit) {
+          const visit = ticket.visit;
+          await tx.visitLocation.updateMany({ where: { visitId: visit.id }, data: { status: 'completed', endedAt: now } });
+          await tx.visit.update({ where: { id: visit.id }, data: { status: 'discontinued', discontinuedReason: 'emergency-lane' } });
+          const room = await tx.room.findUnique({ where: { id: visit.roomId } });
+          if (room) {
+            const swapped = await tx.room.updateMany({ where: { id: room.id, state: room.state }, data: { state: 'free' } });
+            if (swapped.count > 0) {
+              const fresh = await tx.room.findUnique({ where: { id: room.id } });
+              await recordEvent(tx, {
+                type: 'room.state.changed',
+                aggregateId: fresh.id,
+                payload: { roomId: fresh.id, from: room.state, to: 'free', ticketId: ticket.id, reason: 'emergency-lane' },
+                actor,
+              });
+            }
+          }
+        }
+        // Mở ticket mới priority emergency.
+        const newTicket = await tx.queueTicket.create({
+          data: { patientId: ticket.patientId, appointmentId: ticket.appointmentId, dateKey: ticket.dateKey, number: (await tx.queueTicket.findFirst({ where: { dateKey: ticket.dateKey }, orderBy: { number: 'desc' }, select: { number: true } }))?.number + 1 ?? 1, status: 'waiting', priority: 'emergency' },
+        });
+        await recordEvent(tx, {
+          type: 'queue.ticket.changed',
+          aggregateId: ticket.id,
+          payload: { ticketId: ticket.id, number: ticket.number, dateKey: ticket.dateKey, from: ticket.priority, to: 'emergency', reason: 'emergency-lane' },
+          actor,
+        });
+        await recordEvent(tx, {
+          type: 'queue.ticket.changed',
+          aggregateId: newTicket.id,
+          payload: { ticketId: newTicket.id, number: newTicket.number, dateKey: newTicket.dateKey, from: null, to: 'waiting', reason: 'emergency-lane-new' },
+          actor,
+        });
+        return { oldTicket: { ...ticket, priority: 'emergency' }, newTicket: { ...newTicket, priority: 'emergency' } };
+      });
+      res.json(result);
+    } catch (err) { next(err); }
+  });
+
+  // Tiếp nhận đoàn: một thao tác tạo N ticket với groupId chung, STT liền nhau.
+  app.post('/api/group-admission', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
+    const now = new Date();
+    const patients = Array.isArray(req.body?.patients) ? req.body.patients : [];
+    if (patients.length === 0) return res.status(400).json({ error: 'Thiếu danh sách bệnh nhân' });
+    const groupId = `GRP-${randomBytes(4).toString('hex').toUpperCase()}`;
+    const dateKey = dateKeyOf(now);
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        // Tìm max number hôm nay.
+        const last = await tx.queueTicket.findFirst({ where: { dateKey }, orderBy: { number: 'desc' }, select: { number: true } });
+        let nextNumber = (last?.number ?? 0) + 1;
+        const tickets = [];
+        for (const p of patients) {
+          const parsed = parsePatientInput(p);
+          if (parsed.error) throw httpError(400, `Bệnh nhân ${p.fullName}: ${parsed.error}`);
+          const { patient } = await findOrCreatePatient(tx, parsed.data);
+          const ticket = await tx.queueTicket.create({
+            data: { patientId: patient.id, dateKey, number: nextNumber++, status: 'waiting', groupId },
+          });
+          tickets.push({ ticket: publicTicket(ticket), patient: publicPatient(patient) });
+        }
+        await recordEvent(tx, {
+          type: 'queue.ticket.changed',
+          aggregateId: groupId,
+          payload: { groupId, ticketIds: tickets.map((t) => t.ticket.id), count: tickets.length, reason: 'group-admission' },
+          actor,
+        });
+        return { groupId, tickets };
+      });
+      res.json(result);
+    } catch (err) { next(err); }
+  });
+
   // Lỗi nghiệp vụ mang status (httpError) — trả JSON thay vì trang HTML 500 mặc định của Express.
   app.use((err, req, res, next) => {
     if (err.status) {

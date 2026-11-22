@@ -102,10 +102,15 @@ model QueueTicket {
   lastQueuedAt  DateTime  @default(now())
   issuedAt      DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
+  // Ticket 07: nhóm ưu tiên (QĐ 1313) + ActPriority (emergency|urgent|asap|routine)
+  priority      String    @default("routine")
+  // groupId cho đoàn bệnh nhân (khám sức khỏe hợp đồng)
+  groupId       String?
 
   @@unique([dateKey, number])
   @@index([dateKey, status])
   @@index([patientId])
+  @@index([groupId])
   visit Visit?
 }
 
