@@ -11,6 +11,7 @@ async function fetchJson(url, options = {}) {
     const body = await res.json().catch(() => ({}));
     const err = new Error(body.error || `HTTP ${res.status}`);
     err.status = res.status;
+    err.body = body;
     throw err;
   }
   return res.status === 204 ? null : res.json();
@@ -22,6 +23,17 @@ export const apiLogin = (username, password) =>
 export const apiLogout = () => fetchJson('/api/auth/logout', { method: 'POST' });
 
 export const apiMe = () => fetchJson('/api/me');
+
+// ---- Ticket 02: bệnh nhân + kế hoạch hẹn + thẻ hàng đợi ----
+export const apiSearchPatients = (q) => fetchJson(`/api/patients/search?q=${encodeURIComponent(q)}`);
+export const apiCreatePatient = (data) => fetchJson('/api/patients', { method: 'POST', body: JSON.stringify(data) });
+export const apiPublicBook = (data) => fetchJson('/api/public/appointments', { method: 'POST', body: JSON.stringify(data) });
+export const apiCheckInAppointment = (id) =>
+  fetchJson(`/api/appointments/${encodeURIComponent(id)}/check-in`, { method: 'POST' });
+export const apiWalkInCheckIn = (patientId) =>
+  fetchJson(`/api/patients/${encodeURIComponent(patientId)}/check-in`, { method: 'POST' });
+export const apiAppointments = (dateKey = '') => fetchJson(`/api/appointments${dateKey ? `?dateKey=${dateKey}` : ''}`);
+export const apiTickets = (dateKey = '') => fetchJson(`/api/tickets${dateKey ? `?dateKey=${dateKey}` : ''}`);
 
 export function connectSocket() {
   return io({ withCredentials: true });

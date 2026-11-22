@@ -4,12 +4,18 @@ import { ROLE_LABELS } from './roles.js';
 import { renderLogin } from './pages/login.js';
 import { renderWorkspace } from './pages/workspace.js';
 import { renderTv } from './pages/tv.js';
+import { renderBook } from './pages/book.js';
 
 export async function boot() {
   const root = document.getElementById('app');
 
   if (location.pathname === '/tv') {
     renderTv(root);
+    return;
+  }
+
+  if (location.pathname === '/book') {
+    renderBook(root);
     return;
   }
 

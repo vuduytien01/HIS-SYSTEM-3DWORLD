@@ -1,19 +1,10 @@
-// Màn hình làm việc theo vai (ticket 01) — nội dung nghiệp vụ vào các ticket sau.
-// Ba vai có ba nhánh màn riêng; vai này không render màn vai khác.
+// Màn hình làm việc theo vai (ticket 01). Ba vai có ba nhánh màn riêng; vai này không render màn vai khác.
 import { apiLogout, connectSocket } from '../api.js';
 import { ROLE_LABELS } from '../roles.js';
+import { renderReception } from './reception.js';
 
 function receptionScreen(root, user) {
-  root.innerHTML = `
-    <header class="topbar">
-      <span class="brand">Điều phối khám bệnh</span>
-      <span class="user">${user.displayName} · Lễ tân</span>
-      <button id="logout">Đăng xuất</button>
-    </header>
-    <main class="workspace">
-      <p class="placeholder">Bảng điều phối — nội dung vào ticket 02-09.</p>
-    </main>
-  `;
+  renderReception(root, user);
 }
 
 function doctorScreen(root, user) {

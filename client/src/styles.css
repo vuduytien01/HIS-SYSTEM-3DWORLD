@@ -37,3 +37,34 @@ body {
 .error { color: #b91c1c; font-size: 13px; }
 
 .tv { padding: 24px; text-align: center; }
+
+/* ---- Ticket 02: màn lễ tân hai cột, form hồ sơ, bảng danh sách, toast ---- */
+.two-col { display: grid; grid-template-columns: minmax(340px, 420px) 1fr; gap: 20px; align-items: start; }
+.panel { background: #fff; border-radius: 10px; padding: 18px 20px; box-shadow: 0 2px 10px rgba(0,0,0,.06); }
+.panel h2 { margin: 0 0 12px; font-size: 16px; }
+.panel h2 + h2 { margin-top: 24px; }
+#search { width: 100%; padding: 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 15px; }
+.suggest { list-style: none; margin: 8px 0 0; padding: 0; }
+.suggest li button { width: 100%; text-align: left; padding: 8px 10px; border: 1px solid #e5e7eb; background: #fff; border-radius: 6px; margin-bottom: 6px; cursor: pointer; }
+.suggest li button:hover { background: #eef4fb; }
+.muted { color: #6b7280; font-size: 13px; }
+.error-text { color: #b91c1c; font-size: 13px; }
+#selected { margin-top: 16px; padding: 12px; border: 1px solid #dbe3ec; border-radius: 8px; background: #f8fafc; }
+#selected h3 { margin: 0 0 6px; }
+.badge-line { font-size: 13px; color: #0f3d6e; }
+.new-patient summary { cursor: pointer; color: #0f3d6e; font-size: 14px; margin-top: 14px; }
+.new-patient form { display: grid; gap: 8px; margin-top: 10px; }
+.new-patient input, .new-patient select { padding: 8px; border: 1px solid #d1d5db; border-radius: 6px; }
+button.primary { padding: 9px 14px; border: 0; border-radius: 6px; background: #0f3d6e; color: #fff; font-size: 14px; cursor: pointer; }
+button.primary:disabled { opacity: .6; cursor: default; }
+.list { width: 100%; border-collapse: collapse; font-size: 14px; }
+.list th, .list td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eef0f2; }
+.list th { color: #6b7280; font-weight: 600; font-size: 12px; text-transform: uppercase; }
+.toast { position: fixed; right: 20px; bottom: 20px; background: #0f3d6e; color: #fff; padding: 12px 18px; border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.2); }
+
+.book-card { max-width: 420px; margin: 6vh auto; background: #fff; padding: 24px; border-radius: 10px; box-shadow: 0 6px 24px rgba(0,0,0,.08); }
+.book-card h1 { font-size: 20px; margin-top: 0; }
+.book-card label { display: block; margin: 12px 0; font-size: 14px; }
+.book-card input, .book-card select { width: 100%; padding: 8px; margin-top: 4px; border: 1px solid #d1d5db; border-radius: 6px; }
+.book-card button { width: 100%; padding: 10px; border: 0; border-radius: 6px; background: #0f3d6e; color: #fff; font-size: 15px; }
+.ok-line { color: #166534; font-size: 13px; }

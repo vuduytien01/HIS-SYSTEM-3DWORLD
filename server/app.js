@@ -8,6 +8,10 @@ import {
   verifyPassword, createSession, resolveSessionFromCookieHeader,
   setSessionCookie, clearSessionCookie, publicUser,
 } from './auth.js';
+import { requireRole } from './rbac.js';
+import { recordEvent } from './events.js';
+import { dateKeyOf, dayBounds, issueQueueTicket } from './queue.js';
+import { parsePatientInput, findOrCreatePatient, publicPatient } from './patients.js';
 
 const CLIENT_DIR = path.resolve(process.cwd(), 'client');
 
@@ -46,6 +50,188 @@ export function createApp({ vite = null, distDir = null } = {}) {
     res.json({ user: publicUser(req.session.user) });
   });
 
+  // ---- Ticket 02: bệnh nhân, kế hoạch hẹn, thẻ hàng đợi ----
+
+  function httpError(status, message) {
+    const err = new Error(message);
+    err.status = status;
+    return err;
+  }
+
+  function publicAppointment(a) {
+    return {
+      id: a.id,
+      status: a.status,
+      scheduledFor: a.scheduledFor,
+      channel: a.channel,
+      checkedInAt: a.checkedInAt,
+      createdByUserId: a.createdByUserId,
+      patient: publicPatient(a.patient),
+    };
+  }
+
+  function publicTicket(t) {
+    return {
+      id: t.id,
+      number: t.number,
+      dateKey: t.dateKey,
+      status: t.status,
+      issuedAt: t.issuedAt,
+      appointmentId: t.appointmentId,
+      patient: t.patient ? publicPatient(t.patient) : null,
+    };
+  }
+
+  // Hai sự kiện check-in nằm cùng transaction với thay đổi state.
+  async function recordCheckInEvents(tx, { patientId, appointment, ticket, actor, from, reason }) {
+    const actorInfo = { actorType: 'user', actorUserId: actor.id, actorLabel: actor.displayName };
+    await recordEvent(tx, {
+      type: 'patient.status.changed',
+      aggregateId: patientId,
+      payload: { subjectStatus: 'arrived', appointmentId: appointment.id, from, to: 'checked-in' },
+      ...actorInfo,
+    });
+    await recordEvent(tx, {
+      type: 'queue.ticket.changed',
+      aggregateId: ticket.id,
+      payload: { ticketId: ticket.id, number: ticket.number, dateKey: ticket.dateKey, from: null, to: 'waiting', reason },
+      ...actorInfo,
+    });
+  }
+
+  // Tìm bệnh nhân: vài chữ đầu tên hoặc vài số điện thoại.
+  app.get('/api/patients/search', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    try {
+      const q = String(req.query.q ?? '').trim();
+      if (q.length < 2) return res.json({ patients: [] });
+      const patients = await prisma.patient.findMany({
+        where: { OR: [{ fullName: { contains: q } }, { phone: { contains: q } }] },
+        orderBy: { fullName: 'asc' },
+        take: 20,
+      });
+      res.json({ patients: patients.map(publicPatient) });
+    } catch (err) { next(err); }
+  });
+
+  // Lễ tân tạo hồ sơ bệnh nhân mới.
+  app.post('/api/patients', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    const parsed = parsePatientInput(req.body);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    try {
+      const dup = await prisma.patient.findUnique({ where: { nationalId: parsed.data.nationalId } });
+      if (dup) {
+        return res.status(409).json({ error: `CCCD ${parsed.data.nationalId} đã có hồ sơ`, patient: publicPatient(dup) });
+      }
+      const patient = await prisma.patient.create({ data: parsed.data });
+      res.status(201).json({ patient: publicPatient(patient) });
+    } catch (err) { next(err); }
+  });
+
+  // Kênh web công cộng: bệnh nhân đặt kế hoạch hẹn online (booked); khớp hồ sơ theo CCCD.
+  app.post('/api/public/appointments', async (req, res, next) => {
+    const scheduledFor = new Date(String(req.body?.scheduledFor ?? ''));
+    if (Number.isNaN(scheduledFor.getTime())) return res.status(400).json({ error: 'Thời gian hẹn không hợp lệ' });
+    const parsed = parsePatientInput(req.body);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        const { patient, created } = await findOrCreatePatient(tx, parsed.data);
+        const appointment = await tx.appointment.create({
+          data: { patientId: patient.id, status: 'booked', channel: 'online', scheduledFor },
+        });
+        return { appointment: publicAppointment({ ...appointment, patient }), patient: publicPatient(patient), created };
+      });
+      res.status(201).json(result);
+    } catch (err) { next(err); }
+  });
+
+  // Check-in hẹn booked tại quầy: Appointment → checked-in + cấp STT trong ngày.
+  app.post('/api/appointments/:id/check-in', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    const actor = req.session.user;
+    const now = new Date();
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        const appointment = await tx.appointment.findUnique({ where: { id: req.params.id } });
+        if (!appointment) throw httpError(404, 'Không tìm thấy hẹn');
+        if (appointment.status === 'checked-in') throw httpError(409, 'Hẹn đã check-in');
+        if (appointment.status !== 'booked') throw httpError(409, `Hẹn ở trạng thái ${appointment.status}, không check-in được`);
+        const updated = await tx.appointment.update({
+          where: { id: appointment.id },
+          data: { status: 'checked-in', checkedInAt: now },
+          include: { patient: true },
+        });
+        const ticket = await issueQueueTicket(tx, {
+          patientId: appointment.patientId,
+          appointmentId: appointment.id,
+          dateKey: dateKeyOf(now),
+        });
+        await recordCheckInEvents(tx, {
+          patientId: appointment.patientId, appointment, ticket, actor, from: 'booked', reason: 'check-in',
+        });
+        return { appointment: publicAppointment(updated), ticket: publicTicket(ticket) };
+      });
+      res.json(result);
+    } catch (err) {
+      if (err.status) return res.status(err.status).json({ error: err.message });
+      next(err);
+    }
+  });
+
+  // Walk-in tại quầy: Appointment checked-in một bước + cấp STT.
+  app.post('/api/patients/:id/check-in', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    const actor = req.session.user;
+    const now = new Date();
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        const patient = await tx.patient.findUnique({ where: { id: req.params.id } });
+        if (!patient) throw httpError(404, 'Không tìm thấy bệnh nhân');
+        const appointment = await tx.appointment.create({
+          data: { patientId: patient.id, status: 'checked-in', channel: 'desk', scheduledFor: now, checkedInAt: now },
+        });
+        const ticket = await issueQueueTicket(tx, {
+          patientId: patient.id,
+          appointmentId: appointment.id,
+          dateKey: dateKeyOf(now),
+        });
+        await recordCheckInEvents(tx, {
+          patientId: patient.id, appointment, ticket, actor, from: null, reason: 'walk-in',
+        });
+        return {
+          appointment: publicAppointment({ ...appointment, patient }),
+          ticket: publicTicket(ticket),
+        };
+      });
+      res.json(result);
+    } catch (err) {
+      if (err.status) return res.status(err.status).json({ error: err.message });
+      next(err);
+    }
+  });
+
+  // Danh sách ngày hẹn và thẻ hàng đợi trong một ngày (mặc định hôm nay).
+  app.get('/api/appointments', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    try {
+      const [start, end] = dayBounds(String(req.query.dateKey ?? dateKeyOf(new Date())));
+      const appointments = await prisma.appointment.findMany({
+        where: { scheduledFor: { gte: start, lt: end } },
+        include: { patient: true },
+        orderBy: { scheduledFor: 'asc' },
+      });
+      res.json({ appointments: appointments.map(publicAppointment) });
+    } catch (err) { next(err); }
+  });
+
+  app.get('/api/tickets', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    try {
+      const tickets = await prisma.queueTicket.findMany({
+        where: { dateKey: String(req.query.dateKey ?? dateKeyOf(new Date())) },
+        include: { patient: true },
+        orderBy: { number: 'asc' },
+      });
+      res.json({ tickets: tickets.map(publicTicket) });
+    } catch (err) { next(err); }
+  });
+
   // Vite middleware phục vụ module JS/CSS khi dev — sau routes API, trước fallback SPA
   if (vite) app.use(vite.middlewares);
 
@@ -62,6 +248,7 @@ export function createApp({ vite = null, distDir = null } = {}) {
   };
   app.get('/', sendIndex);
   app.get('/tv', sendIndex);
+  app.get('/book', sendIndex);
 
   return app;
 }

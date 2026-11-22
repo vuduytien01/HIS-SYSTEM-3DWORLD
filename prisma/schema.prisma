@@ -32,3 +32,70 @@ model Session {
 
   @@index([userId])
 }
+
+// Ticket 02: hồ sơ bệnh nhân. Giới tính theo FHIR AdministrativeGender (male|female|other|unknown).
+model Patient {
+  id              String        @id @default(cuid())
+  fullName        String
+  dob             DateTime
+  gender          String
+  nationalId      String?       @unique
+  medicalRecordNo String?       @unique
+  insuranceNo     String?
+  phone           String
+  createdAt       DateTime      @default(now())
+  appointments    Appointment[]
+  queueTickets    QueueTicket[]
+}
+
+// Kế hoạch hẹn — vòng đời FHIR R5 giản lược: booked → checked-in (ticket 02), các nhánh sau của ticket 05+.
+model Appointment {
+  id              String        @id @default(cuid())
+  patientId       String
+  patient         Patient       @relation(fields: [patientId], references: [id])
+  status          String // proposed|pending|booked|arrived|checked-in|fulfilled|cancelled|noshow|entered-in-error
+  scheduledFor    DateTime
+  // online: bệnh nhân đặt từ kênh web; desk: walk-in tạo tại quầy
+  channel         String
+  checkedInAt     DateTime?
+  createdByUserId String?
+  createdAt       DateTime      @default(now())
+  queueTickets    QueueTicket[]
+
+  @@index([patientId, scheduledFor])
+  @@index([status, scheduledFor])
+}
+
+// Thẻ hàng đợi hạng nhất — STT cấp theo ngày, reset mỗi sáng (dateKey).
+model QueueTicket {
+  id           String      @id @default(cuid())
+  patientId    String
+  patient      Patient     @relation(fields: [patientId], references: [id])
+  appointmentId String?
+  appointment  Appointment? @relation(fields: [appointmentId], references: [id])
+  dateKey      String // YYYY-MM-DD theo giờ server
+  number       Int
+  // waiting|called|present|parked|skipped|no-show
+  status       String      @default("waiting")
+  issuedAt     DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  @@unique([dateKey, number])
+  @@index([dateKey, status])
+  @@index([patientId])
+}
+
+// Kho sự kiện append-only — timestamp server, chỉ ghi thêm. 7 nhóm theo spec; ticket 02 dùng 2 nhóm đầu.
+model Event {
+  id          String   @id @default(cuid())
+  type        String
+  aggregateId String // patientId / ticketId tuỳ type
+  payload     String // JSON của SQLite: stringify khi ghi
+  actorType   String // user|patient-web|system
+  actorUserId String?
+  actorLabel  String
+  occurredAt  DateTime @default(now())
+
+  @@index([type, occurredAt])
+  @@index([aggregateId, occurredAt])
+}
