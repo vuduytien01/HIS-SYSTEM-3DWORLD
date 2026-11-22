@@ -1,0 +1,34 @@
+// Prisma schema — ticket 01: User + Session.
+// Dev local: SQLite (file:./dev.db). Deploy (ticket 14): đổi provider thành postgres + DATABASE_URL Postgres.
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String    @id @default(cuid())
+  username     String    @unique
+  passwordHash String
+  // RECEPTIONIST | DOCTOR | ADMIN
+  role         String
+  displayName  String
+  active       Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  sessions     Session[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  // SHA-256 của token cookie; token gốc chỉ sống trong cookie httpOnly
+  tokenHash String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}

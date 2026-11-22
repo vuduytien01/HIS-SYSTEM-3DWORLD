@@ -1,0 +1,39 @@
+# Persona Admin — Báo cáo vòng 2 (cross-examination)
+
+*Agent hội đồng roleplay admin vận hành. Tự tin 0.7 → 0.8.*
+
+## 1. Phản hồi từng vai
+
+**Lễ tân.** Chấp nhận ba điểm. Sáu nút một cú bấm trên dòng bệnh nhân nằm đúng phạm vi quyền quầy của ma trận vòng 1, không cần đàm phán lại. Kéo thả 3D là tùy chọn khớp lập trường của tôi: bảng điều khiển phẳng phải tự chạy khi 3D chết. Phòng ngừng hoạt động thành trạng thái dữ liệu hạng nhất giải kịch bản X-quang hỏng tốt hơn tờ giấy. Nhượng bộ thêm hai nhóm quyền, chi tiết ở mục 2d. Phản đối một điểm: lễ tân nói override có audit là để bảo vệ cô ấy, đúng, nhưng lý do override phải bắt buộc chọn từ danh sách, không gõ tự do. Gõ tự do tạo log không tra cứu được, báo cáo quý thành văn chương. (kinh nghiệm roleplay vận hành)
+
+**Bệnh nhân.** Chấp nhận toàn bộ zero-PII. Màn hình công khai không có trường tên ngay ở API là cách chặn đúng biên, khớp nguyên tắc của tôi "không ai xóa log". Định nghĩa no-show của tôi "gọi quá 3 phút không có mặt" phải sửa theo opd-fhir: giữa phiên là skipped, no-show chốt cuối phiên, báo cáo cuối ngày của tôi đổi theo. Kênh giấy và kênh không smartphone ghi vào điều kiện nghiệm thu, không phải mong muốn. Kịch bản màn hình trắng của bệnh nhân và kịch bản outage của tôi là một hệ lụy, kiến trúc sư đã có ràng buộc reconnect xin snapshot, tôi coi phần này đóng. (kinh nghiệm roleplay tuyến tỉnh)
+
+**Bác sĩ.** Chấp nhận nút ghép complete-and-call-next kèm điều kiện dữ liệu của bác sĩ: đồng hồ bệnh nhân N đóng khi N bấm nút, không chạy sang N+1. Điều kiện này quan trọng cho báo cáo của tôi hơn cho bác sĩ, vì nó giữ thời gian phục vụ không bị lùn một cách hệ thống. Cơ chế cờ phòng im lặng gấp rưỡi trung vị: thêm vào dashboard của tôi như chỉ báo, không hành vi tự động ngoài cảnh báo. Ngưỡng đó là suy luận, phải đo lại trên dữ liệu thật trước khi cố định. Nút thứ ba trong menu ẩn chấp nhận, các sự kiện nó phát rơi đúng vào nhóm sự kiện hiện có của kiến trúc sư. (suy luận)
+
+**opd-fhir.** Chấp nhận QueueTicket vào v1 làm thực thể hạng nhất. Đây là điểm tôi sai ở vòng 1: premortem 2 của tôi giả định "chuyển khối" là một nút mà không hỏi nút đó bấm vào cái gì. Chi tiết ở mục 2b. Chấp nhận nguyên tắc "không thêm bước phê duyệt, hệ thống chỉ ghi actor và thời điểm" cho mọi thao tác vận hành, nó đánh thẳng vào ngưỡng 5 lần của tôi, xem mục 2c. Chấp nhận entered-in-error như sự kiện đánh dấu chứ không phải xóa, khớp dòng "không ai được xóa" của ma trận. (suy luận từ đối chiếu spec đã dẫn)
+
+**Kiến trúc sư.** Chấp nhận world là phép chiếu, server chỉ phát sự kiện trạng thái, snapshot khi reconnect. Phản đối một điểm: 5 nhóm sự kiện thiếu kênh cấu hình, mục 2a. Con số hiệu năng (ack 300ms, 50 agent, 50 sự kiện/giây) là mục tiêu thiết kế chưa đo; với vai admin tôi yêu cầu đo trước khi ghi thành SLA cho lãnh đạo, số chưa đo không được vào báo cáo quý. (suy luận)
+
+## 2. Đối chất trực tiếp
+
+**(a) Kênh sự kiện cấu hình — yêu cầu thêm nhóm thứ sáu là hợp lý.** Nhóm room.state.changed là trạng thái vận hành (free, occupied, cleaning, alert), không phải cấu hình. Đổi tên hiển thị, đổi ngưỡng SLA, đổi thời gian trung bình, đổi lịch ca: không cái nào thuộc 5 nhóm hiện có, nhưng tất cả đổi cái mà client đang vẽ. Kịch bản 1 của tôi chết đúng vì khoảng trống này. Đề xuất nhóm `config.updated`: mang loại thực thể, id, phiên bản tăng đơn điệu; client nhận thì áp diff hoặc xin snapshot mới. Tần suất thấp, vài chục lần một ngày, không đe dọa ngân sách 50 sự kiện/giây của kiến trúc sư. (suy luận từ premortem roleplay)
+
+**(b) Chuyển khối 38 số phải thiết kế trên QueueTicket.** Đúng. Vòng 1 tôi mô tả chuyển khối như thao tác UI, không mô hình dữ liệu. Trên QueueTicket, chuyển khối là bulk operation: lọc nguồn theo trạng thái (waiting, skipped) của quầy nguồn, chọn đích trong cùng nhóm chức năng, preview "sẽ chuyển N số", xác nhận là một transaction; mỗi vé ghi actor, lý do, thời điểm; cộng một sự kiện tổng kết cho dashboard. Đồng hồ chờ giữ nguyên thời điểm cấp số gốc, không reset, vì chờ đo từ cấp số tới bắt đầu khám. Không có QueueTicket thì không thể ghi log từng vé đúng lời hứa của ma trận. Tôi rút premortem 2 ở dạng cũ, giữ kịch bản, đổi thiết kế. (suy luận)
+
+**(c) Ngưỡng 5 lần đổi priority mỗi giờ: giữ như giám sát, bỏ như biện phòng.** opd-fhir đúng. Chặn cứng lần thứ sáu là bước phê duyệt ngầm, sinh cái ghế trống lúc đêm mà vai đó mô tả. Đổi ý: bỏ hạn chế cứng, giữ metric "tần suất đổi priority theo quầy" trên dashboard, cảnh báo admin khi vượt ngưỡng (10/giờ làm số khởi điểm, hiệu chỉnh theo dữ liệu thật). Người lạm dụng bị nhìn thấy, không bị khóa tay. (kinh nghiệm roleplay + suy luận)
+
+**(d) Nhượng bộ quyền lễ tân — đường giới hạn mới.** Nhượng: sáu nút dòng (recall, skip, park, no-show, ưu tiên, cấp cứu); tiếp nhận đoàn một thao tác; kéo vào làn cấp cứu toàn cục, vì cấp cứu không theo phạm vi quầy; gắn cờ phòng hỏng và resume trong phạm vi quầy mình; override đóng lượt khám bác sĩ quên bấm với lý do bắt buộc. Không nhượng: sửa luồng, sửa thời gian trung bình, sửa ngưỡng SLA, mở khóa tài khoản, cấp vai, chuyển khối vượt phạm vi quầy mình, xóa bất kỳ sự kiện nào. Cờ phòng hỏng là nhượng bộ lớn nhất vì chạm ranh giới cấu hình. Ranh giới vẽ ở đây: lễ tân đổi trạng thái vận hành của phòng, admin đổi định nghĩa của phòng. (kinh nghiệm roleplay)
+
+**(e) p50 p90 — sau khi mọi vai chốt thiết kế, cái gì đo được thật.** Timestamp do server ghi, không ai sửa: cấp số (issuedAt trên QueueTicket), gọi (callAttempts), bắt đầu (location entry active, thời điểm suy từ bệnh nhân bước vào phòng, sai số biên đầu được bác sĩ chấp nhận), kết thúc (nút xong khám). Từ đó thật: chờ (cấp số → bắt đầu), phục vụ (bắt đầu → kết thúc), thời gian từng đợt trạm phụ nếu mỗi đợt có entry location, bản đồ nhiệt giờ cao điểm. Thiếu hoặc ước lượng: khoảng discharged → completed nếu quầy thu ngân không vào v1, vì opd-fhir xếp quyết toán ra ngoài và chưa ai được chỉ định bấm completed; phân biệt no-show thật với gọi không có mặt phụ thuộc chốt cuối phiên; lý do kéo dài không có nếu không bắt nhập. Tôi yêu cầu synthesis chốt một dòng: trigger của completed trong v1 thuộc vai nào. (suy luận)
+
+**(f) Bảng sự kiện append-only 12 tháng vs Provenance.** Khớp nguyên tắc, lệch phạm vi. Provenance ghi ai khi nào đụng tài nguyên FHIR; bảng sự kiện của tôi ghi mỗi thao tác kèm giá trị trước sau. Đề xuất: một kho sự kiện append-only duy nhất làm chuẩn, Provenance sinh như projection cho phía tích hợp HIS, cùng retention, cùng quy tắc không xóa. Giữ hai kho độc lập sẽ phân kỳ và dòng "không ai được xóa" mất nghĩa ở một phía. (suy luận)
+
+## 3. Position tổng
+
+Giữ: bảng sự kiện append-only và cấu hình có phiên bản là nguồn sự thật; bảng điều khiển phẳng ưu tiên trên 3D; phần cứng của ma trận quyền (không ai xóa, cấu hình chỉ admin, tài khoản chỉ admin); hai nút bác sĩ với timestamp do server ghi.
+
+Đổi năm điểm: thêm nhóm sự kiện `config.updated` thứ sáu; chuyển khối thiết kế lại thành bulk operation trên QueueTicket; bỏ hạn chế cứng 5 lần/giờ đổi thành metric giám sát kèm cảnh báo; mở rộng nhượng bộ lễ tân (sáu nút dòng, đoàn, làn cấp cứu, cờ phòng, override có lý do); no-show chốt cuối phiên với skipped làm trạng thái trung gian.
+
+Còn treo, cần synthesis chốt: trigger của completed trong v1 thuộc vai nào; hiệu chỉnh các ngưỡng cảnh báo trên dữ liệu thật trước khi cố định; chờ đo từ cấp số gốc được giữ qua chuyển khối.
+
+Tự tin mới 0.8, trước là 0.7. Lý do nâng: bốn vai độc lập hội tụ về ba lập trường cốt lõi của tôi, nguồn sự thật nằm ở dữ liệu không ở world, mọi thay đổi đi qua sự kiện ghi thêm, quyết định vận hành không cần phê duyệt. Mỗi luận điểm phản biện của tôi hoặc được chấp nhận hoặc được thay bằng phương án tốt hơn có tên chủ sở hữu. Chưa lên cao hơn vì các ngưỡng số (5 hay 10 lần, gấp rưỡi trung vị, 3 phút park) vẫn là suy luận chưa đo, và ranh giới v1 phía thu ngân chưa có chủ. (suy luận)
