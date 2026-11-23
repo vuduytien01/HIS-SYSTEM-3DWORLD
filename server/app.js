@@ -1065,6 +1065,685 @@ export function createApp({ vite = null, distDir = null } = {}) {
     }
   });
 
+  // ---- Ticket 10: Doctor thin console ----
+
+  // Lấy các lượt khám của bác sĩ (room của bác sĩ đang trực).
+  app.get('/api/doctor/visits', requireRole('DOCTOR'), async (req, res, next) => {
+    try {
+      const doctorId = req.session.user.id;
+      // Tìm room của bác sĩ (giả sử room có doctorId hoặc bác sĩ trực room)
+      const rooms = await prisma.room.findMany({ where: { active: true } });
+      // Bác sĩ chỉ thấy visit của room mình phụ trách - simplified: tất cả visit in-progress của các room active
+      const visits = await prisma.visit.findMany({
+        where: {
+          room: { active: true },
+          status: { in: ['planned', 'in-progress', 'on-hold'] },
+        },
+        include: {
+          ticket: { include: { patient: true } },
+          room: true,
+        },
+        orderBy: { createdAt: 'asc' },
+      });
+      // Thêm wait time (time since in-progress) cho phát hiện quên
+      const now = new Date();
+      const visitsWithWait = visits.map((v) => ({
+        ...v,
+        waitMs: v.status === 'in-progress' && v.updatedAt ? now.getTime() - new Date(v.updatedAt).getTime() : 0,
+      }));
+      res.json({ visits: visitsWithWait });
+    } catch (err) { next(err); }
+  });
+
+  // Nút ghép complete-and-call-next: discharged visit N + call next waiting (cùng transactionId).
+  app.post('/api/doctor/complete-and-call-next', requireRole('DOCTOR'), async (req, res, next) => {
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
+    const { visitId, roomId, callNow = true } = req.body ?? {};
+    const now = new Date();
+    const transactionId = randomBytes(8).toString('hex');
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        const visit = await tx.visit.findUnique({ where: { id: visitId }, include: { ticket: true, room: true } });
+        if (!visit) throw httpError(404, 'Không tìm thấy lượt khám');
+        if (visit.status !== 'in-progress') throw httpError(409, `Lượt khám không ở in-progress (${visit.status})`);
+
+        // 1. Discharged visit N
+        await tx.visitLocation.updateMany({ where: { visitId: visit.id, status: 'active' }, data: { status: 'completed', endedAt: now } });
+        await tx.visit.update({ where: { id: visit.id }, data: { status: 'discharged' } });
+        await recordEvent(tx, {
+          type: 'encounter.location.changed',
+          aggregateId: visit.id,
+          payload: { visitId: visit.id, roomId: visit.roomId, status: 'completed' },
+          actor,
+        });
+
+        // 2. Room free
+        const room = await tx.room.findUnique({ where: { id: visit.roomId } });
+        if (room) {
+          const swapped = await tx.room.updateMany({ where: { id: room.id, state: room.state }, data: { state: 'free' } });
+          if (swapped.count > 0) {
+            const fresh = await tx.room.findUnique({ where: { id: room.id } });
+            await recordEvent(tx, {
+              type: 'room.state.changed',
+              aggregateId: fresh.id,
+              payload: { roomId: fresh.id, from: room.state, to: 'free', visitId: visit.id },
+              actor,
+            });
+          }
+        }
+
+        // 3. Call next waiting ticket (nếu có và callNow)
+        let nextTicket = null;
+        if (callNow) {
+          const next = await tx.queueTicket.findFirst({
+            where: { dateKey: dateKeyOf(now), status: 'waiting' },
+            orderBy: { number: 'asc' },
+          });
+          if (next) {
+            const swapped = await tx.queueTicket.updateMany({
+              where: { id: next.id, status: 'waiting' },
+              data: { status: 'called', callAttempts: { increment: 1 } },
+            });
+            if (swapped.count > 0) {
+              nextTicket = { ...next, status: 'called', callAttempts: next.callAttempts + 1 };
+              await recordEvent(tx, {
+                type: 'queue.ticket.changed',
+                aggregateId: next.id,
+                payload: { ticketId: next.id, number: next.number, dateKey: next.dateKey, from: 'waiting', to: 'called', reason: 'auto-call-next', transactionId },
+                actor,
+              });
+            }
+          }
+        }
+
+        // Events for complete-and-call-next (transactionId ghép 2 sự kiện)
+        await recordEvent(tx, {
+          type: 'assignment.revoked',
+          aggregateId: visit.ticketId,
+          payload: { visitId: visit.id, roomId: visit.roomId, reason: 'complete-and-call-next', transactionId },
+          actor,
+        });
+
+        return { visit: { ...visit, status: 'discharged' }, nextTicket, transactionId };
+      });
+      res.json(result);
+    } catch (err) { next(err); }
+  });
+
+  // Doctor exceptions menu: reassign room, on-hold (lab request), discontinued, etc.
+  app.post('/api/doctor/exception', requireRole('DOCTOR'), async (req, res, next) => {
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
+    const { visitId, type, roomId } = req.body ?? {};
+    const now = new Date();
+    try {
+      const visit = await prisma.visit.findUnique({ where: { id: visitId }, include: { room: true } });
+      if (!visit) throw httpError(404, 'Không tìm thấy lượt khám');
+      if (visit.status !== 'in-progress') throw httpError(409, `Chỉ exception khi in-progress (${visit.status})`);
+
+      switch (type) {
+        case 'reassign': {
+          if (!roomId) return res.status(400).json({ error: 'Thiếu roomId' });
+          const room = await prisma.room.findUnique({ where: { id: roomId } });
+          if (!room) throw httpError(404, 'Không tìm thấy phòng');
+          // Guard room accepts (excluding current visit)
+          const activeVisits = await prisma.visit.count({ where: { roomId: room.id, status: { in: ['planned', 'in-progress', 'on-hold'] }, id: { not: visit.id } } });
+          if (activeVisits >= room.capacity) throw httpError(409, `Phòng đã đầy`);
+
+          await prisma.$transaction(async (tx) => {
+            // Old room free
+            const oldRoom = await tx.room.findUnique({ where: { id: visit.roomId } });
+            const oldSwapped = await tx.room.updateMany({ where: { id: oldRoom.id, state: oldRoom.state }, data: { state: 'free' } });
+            if (oldSwapped.count > 0) {
+              const fresh = await tx.room.findUnique({ where: { id: oldRoom.id } });
+              await recordEvent(tx, {
+                type: 'room.state.changed',
+                aggregateId: fresh.id,
+                payload: { roomId: fresh.id, from: oldRoom.state, to: 'free', visitId: visit.id, reason: 'doctor-reassign' },
+                actor,
+              });
+            }
+            // Update visit
+            await tx.visitLocation.updateMany({ where: { visitId: visit.id, status: { in: ['active', 'planned'] } }, data: { status: 'completed', endedAt: now } });
+            await tx.visit.update({ where: { id: visit.id }, data: { roomId, status: 'in-progress' } });
+            await tx.visitLocation.create({ data: { visitId: visit.id, roomId, status: 'active' } });
+            // New room occupied
+            const newSwapped = await tx.room.updateMany({ where: { id: room.id, state: room.state }, data: { state: 'occupied' } });
+            if (newSwapped.count === 0) throw httpError(409, 'Phòng mới vừa bị thay đổi');
+            const freshRoom = await tx.room.findUnique({ where: { id: room.id } });
+            await recordEvent(tx, {
+              type: 'room.state.changed',
+              aggregateId: freshRoom.id,
+              payload: { roomId: freshRoom.id, from: room.state, to: 'occupied', visitId: visit.id },
+              actor,
+            });
+            await recordEvent(tx, {
+              type: 'encounter.location.changed',
+              aggregateId: visit.id,
+              payload: { visitId: visit.id, fromRoomId: visit.roomId, toRoomId: room.id, reason: 'doctor-reassign' },
+              actor,
+            });
+            await recordEvent(tx, {
+              type: 'assignment.revoked',
+              aggregateId: visit.ticketId,
+              payload: { visitId: visit.id, roomId: visit.roomId, reason: 'reassign' },
+              actor,
+            });
+            await recordEvent(tx, {
+              type: 'assignment.created',
+              aggregateId: visit.ticketId,
+              payload: { visitId: visit.id, roomId: room.id, roomState: 'occupied' },
+              actor,
+            });
+          });
+          break;
+        }
+        case 'on-hold': {
+          // Yêu cầu cận lâm sàng: visit on-hold, location reserved
+          await prisma.visit.update({ where: { id: visitId }, data: { status: 'on-hold' } });
+          await prisma.visitLocation.updateMany({ where: { visitId, status: 'active' }, data: { status: 'reserved' } });
+          await recordEvent(tx, {
+            type: 'encounter.location.changed',
+            aggregateId: visitId,
+            payload: { visitId, roomId: visit.roomId, status: 'reserved', reason: 'on-hold-lab' },
+            actor,
+          });
+          break;
+        }
+        case 'discontinued': {
+          // Bỏ về giữa chừng
+          await prisma.visitLocation.updateMany({ where: { visitId, status: { in: ['active', 'planned'] } }, data: { status: 'completed', endedAt: now } });
+          await prisma.visit.update({ where: { id: visitId }, data: { status: 'discontinued' } });
+          const room = await prisma.room.findUnique({ where: { id: visit.roomId } });
+          if (room) {
+            const swapped = await prisma.room.updateMany({ where: { id: room.id, state: room.state }, data: { state: 'free' } });
+            if (swapped.count > 0) {
+              const fresh = await prisma.room.findUnique({ where: { id: room.id } });
+              await recordEvent(tx, {
+                type: 'room.state.changed',
+                aggregateId: fresh.id,
+                payload: { roomId: fresh.id, from: room.state, to: 'free', visitId: visit.id, reason: 'discontinued' },
+                actor,
+              });
+            }
+          }
+          break;
+        }
+        default:
+          return res.status(400).json({ error: 'Loại exception không hợp lệ' });
+      }
+      res.json({ message: 'Exception processed' });
+    } catch (err) { next(err); }
+  });
+
+  // Phát hiện quên: cờ lên Lễ tân khi in-progress vượt ngưỡng.
+  app.get('/api/doctor/forgotten', requireRole('DOCTOR'), async (req, res, next) => {
+    try {
+      const thresholdMultiplier = await getConfigParam('forgotThresholdMultiplier'); // 1.5
+      const thresholdMin = await getConfigParam('forgotThresholdMinMs'); // 15 * 60 * 1000
+      const now = new Date();
+      const visits = await prisma.visit.findMany({
+        where: { status: 'in-progress', updatedAt: { not: null } },
+        include: { room: true, ticket: { include: { patient: true } } },
+      });
+      const forgotten = [];
+      for (const v of visits) {
+        const median = await getConfigParam(`roomMedianMs_${v.roomId}`) ?? thresholdMin;
+        const threshold = Math.max(median * thresholdMultiplier, thresholdMin);
+        if (now.getTime() - new Date(v.updatedAt).getTime() > threshold) {
+          forgotten.push({ visit: v, waitMs: now.getTime() - new Date(v.updatedAt).getTime(), threshold });
+        }
+      }
+      res.json({ forgotten });
+    } catch (err) { next(err); }
+  });
+
+  // ---- Ticket 11: Khu thu ngân — discharged → completed sau thanh toán + sweep cuối ngày ----
+
+  // Lấy các lượt ở khu thu ngân (status discharged) để hiển thị trên màn hình Lễ tân/Thu ngân.
+  app.get('/api/cashier/pending', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    try {
+      const visits = await prisma.visit.findMany({
+        where: { status: 'discharged' },
+        include: { ticket: { include: { patient: true } }, room: true },
+        orderBy: { updatedAt: 'asc' },
+      });
+      res.json({ visits });
+    } catch (err) { next(err); }
+  });
+
+  // Đóng tiền: chuyển discharged → completed. Chỉ cho phép nếu visit đã có tín hiệu xong khám (status discharged).
+  app.post('/api/cashier/payment', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
+    const { visitId } = req.body ?? {};
+    const now = new Date();
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        const visit = await tx.visit.findUnique({ where: { id: visitId }, include: { ticket: true, room: true } });
+        if (!visit) throw httpError(404, 'Không tìm thấy lượt khám');
+        if (visit.status !== 'discharged') {
+          throw httpError(409, `Chỉ thanh toán được lượt đã xong khám (discharged), hiện tại: ${visit.status}`);
+        }
+        // 1. Chuyển visit sang completed
+        await tx.visit.update({ where: { id: visit.id }, data: { status: 'completed' } });
+        await recordEvent(tx, {
+          type: 'encounter.location.changed',
+          aggregateId: visit.id,
+          payload: { visitId: visit.id, status: 'completed', reason: 'payment-completed' },
+          actor,
+        });
+
+        // 2. Nếu visit còn location active/reserved/planned thì completed
+        await tx.visitLocation.updateMany({
+          where: { visitId: visit.id, status: { in: ['active', 'planned', 'reserved'] } },
+          data: { status: 'completed', endedAt: now },
+        });
+
+        return { visit: { ...visit, status: 'completed' } };
+      });
+      res.json(result);
+    } catch (err) { next(err); }
+  });
+
+  // Sweep cuối ngày: in-progress treo chuyển discharged + nhãn autoClosed; on-hold không bị đụng.
+  app.post('/api/cashier/end-of-day-sweep', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
+    const now = new Date();
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        // Tìm các visit in-progress đã quá hạn (ví dụ > 4 tiếng không cập nhật)
+        const stuckThresholdMs = 4 * 60 * 60 * 1000; // 4 giờ
+        const cutoff = new Date(now.getTime() - stuckThresholdMs);
+        const stuckVisits = await tx.visit.findMany({
+          where: {
+            status: 'in-progress',
+            updatedAt: { lt: cutoff },
+          },
+          include: { ticket: true, room: true },
+        });
+
+        let count = 0;
+        for (const visit of stuckVisits) {
+          // Chỉ discharged, KHÔNG bao giờ completed tự động
+          await tx.visitLocation.updateMany({
+            where: { visitId: visit.id, status: { in: ['active', 'planned', 'reserved'] } },
+            data: { status: 'completed', endedAt: now },
+          });
+          await tx.visit.update({
+            where: { id: visit.id },
+            data: { status: 'discharged' },
+          });
+          await recordEvent(tx, {
+            type: 'encounter.location.changed',
+            aggregateId: visit.id,
+            payload: { visitId: visit.id, roomId: visit.roomId, status: 'completed', reason: 'autoClosed', autoClosed: true },
+            actor,
+          });
+          // Room free
+          if (visit.roomId) {
+            const room = await tx.room.findUnique({ where: { id: visit.roomId } });
+            if (room && room.state === 'occupied') {
+              const swapped = await tx.room.updateMany({ where: { id: room.id, state: room.state }, data: { state: 'free' } });
+              if (swapped.count > 0) {
+                const fresh = await tx.room.findUnique({ where: { id: room.id } });
+                await recordEvent(tx, {
+                  type: 'room.state.changed',
+                  aggregateId: fresh.id,
+                  payload: { roomId: fresh.id, from: room.state, to: 'free', visitId: visit.id, reason: 'autoClosed' },
+                  actor,
+                });
+              }
+            }
+          }
+          count++;
+        }
+        return { swept: count, visits: stuckVisits.map(v => v.id) };
+      });
+      res.json(result);
+    } catch (err) { next(err); }
+  });
+
+  // ---- Ticket 12: Admin — cấu hình Phòng + tham số vận hành + config.changed ----
+
+  // Lấy configVersion (tăng dần mỗi khi có thay đổi config)
+  let configVersion = 0;
+  async function emitConfigChanged(tx, actor, detail) {
+    configVersion++;
+    await recordEvent(tx, {
+      type: 'config.changed',
+      aggregateId: 'config',
+      payload: { configVersion, detail, timestamp: new Date().toISOString() },
+      actor,
+    });
+  }
+
+  // Danh sách phòng (admin xem đầy đủ, lễ tân xem publicRooms)
+  app.get('/api/admin/rooms', requireRole('ADMIN'), async (req, res, next) => {
+    try {
+      const rooms = await prisma.room.findMany({ orderBy: { createdAt: 'asc' } });
+      res.json({ rooms, configVersion });
+    } catch (err) { next(err); }
+  });
+
+  // Thêm phòng mới (chỉ ADMIN) — mã không trùng, không sửa được mã sau khi tạo
+  app.post('/api/admin/rooms', requireRole('ADMIN'), async (req, res, next) => {
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
+    const { code, name, kind, width, depth, x, z, capacity, prefix, active, zone, specialty, shiftSchedule, doctorId, sharedQueue } = req.body ?? {};
+    if (!code || !name || !kind) return res.status(400).json({ error: 'Thiếu code, name hoặc kind' });
+    if (!['CONSULT', 'ANCILLARY', 'CASHIER'].includes(kind)) return res.status(400).json({ error: 'kind phải là CONSULT|ANCILLARY|CASHIER' });
+    try {
+      const room = await prisma.$transaction(async (tx) => {
+        const exists = await tx.room.findUnique({ where: { code } });
+        if (exists) throw httpError(409, 'Mã phòng đã tồn tại');
+        const room = await tx.room.create({
+          data: {
+            code,
+            name,
+            kind,
+            width: width ?? 5,
+            depth: depth ?? 4,
+            x: x ?? 0,
+            z: z ?? 0,
+            capacity: capacity ?? 1,
+            prefix: prefix ?? null,
+            active: active ?? true,
+            zone: zone ?? null,
+            specialty: specialty ?? null,
+            shiftSchedule: shiftSchedule ?? null,
+            doctorId: doctorId ?? null,
+            sharedQueue: sharedQueue ?? false,
+          },
+        });
+        await emitConfigChanged(tx, actor, { action: 'create-room', room: { id: room.id, code: room.code, name: room.name } });
+        return room;
+      });
+      res.json({ room });
+    } catch (err) { next(err); }
+  });
+
+  // Sửa phòng (chỉ ADMIN) — tên hiển thị đổi được, mã không đổi được
+  app.patch('/api/admin/rooms/:id', requireRole('ADMIN'), async (req, res, next) => {
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
+    const { name, kind, width, depth, x, z, capacity, prefix, active, zone, specialty, shiftSchedule, doctorId, sharedQueue, disabledReason, reopenAt, state } = req.body ?? {};
+    try {
+      const room = await prisma.$transaction(async (tx) => {
+        const current = await tx.room.findUnique({ where: { id: req.params.id } });
+        if (!current) throw httpError(404, 'Không tìm thấy phòng');
+        // Không cho sửa code
+        const updated = await tx.room.update({
+          where: { id: current.id },
+          data: {
+            name: name ?? current.name,
+            kind: kind ?? current.kind,
+            width: width ?? current.width,
+            depth: depth ?? current.depth,
+            x: x ?? current.x,
+            z: z ?? current.z,
+            capacity: capacity ?? current.capacity,
+            prefix: prefix ?? current.prefix,
+            active: active ?? current.active,
+            zone: zone ?? current.zone,
+            specialty: specialty ?? current.specialty,
+            shiftSchedule: shiftSchedule ?? current.shiftSchedule,
+            doctorId: doctorId ?? current.doctorId,
+            sharedQueue: sharedQueue ?? current.sharedQueue,
+            disabledReason: disabledReason ?? current.disabledReason,
+            reopenAt: reopenAt ?? current.reopenAt,
+            state: state ?? current.state,
+          },
+        });
+        await emitConfigChanged(tx, actor, { action: 'update-room', room: { id: updated.id, code: updated.code, name: updated.name } });
+        return updated;
+      });
+      res.json({ room });
+    } catch (err) { next(err); }
+  });
+
+  // Lễ tân đổi trạng thái vận hành phòng (disabled/alert/free) — không được định nghĩa phòng mới
+  app.patch('/api/rooms/:id/state', requireRole('RECEPTIONIST'), async (req, res, next) => {
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
+    const { state, disabledReason, reopenAt } = req.body ?? {};
+    const allowedStates = ['free', 'disabled', 'alert'];
+    if (!state || !allowedStates.includes(state)) {
+      return res.status(400).json({ error: 'state phải là free|disabled|alert' });
+    }
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        const room = await tx.room.findUnique({ where: { id: req.params.id } });
+        if (!room) throw httpError(404, 'Không tìm thấy phòng');
+        const swapped = await tx.room.updateMany({ where: { id: room.id, state: room.state }, data: { state, disabledReason: disabledReason ?? null, reopenAt: reopenAt ? new Date(reopenAt) : null } });
+        if (swapped.count === 0) throw httpError(409, 'Phòng vừa bị thay đổi bởi thao tác khác');
+        const fresh = await tx.room.findUnique({ where: { id: room.id } });
+        await recordEvent(tx, {
+          type: 'room.state.changed',
+          aggregateId: fresh.id,
+          payload: { roomId: fresh.id, from: room.state, to: fresh.state, disabledReason: fresh.disabledReason, reopenAt: fresh.reopenAt },
+          actor,
+        });
+        await emitConfigChanged(tx, actor, { action: 'room-state', room: { id: fresh.id, code: fresh.code, state: fresh.state } });
+        return fresh;
+      });
+      res.json({ room: result });
+    } catch (err) { next(err); }
+  });
+
+  // Lấy tham số vận hành (admin + lễ tân đều đọc được)
+  app.get('/api/admin/config-params', requireRole('ADMIN', 'RECEPTIONIST', 'DOCTOR'), async (req, res, next) => {
+    try {
+      const params = await prisma.config.findMany({ orderBy: { key: 'asc' } });
+      res.json({ params, configVersion });
+    } catch (err) { next(err); }
+  });
+
+  // Cập nhật tham số vận hành (chỉ ADMIN)
+  app.post('/api/admin/config-params', requireRole('ADMIN'), async (req, res, next) => {
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
+    const { key, value } = req.body ?? {};
+    if (!key || value === undefined) return res.status(400).json({ error: 'Thiếu key hoặc value' });
+    try {
+      const param = await prisma.$transaction(async (tx) => {
+        const current = await tx.config.findUnique({ where: { key } });
+        let updated;
+        if (current) {
+          updated = await tx.config.update({ where: { key }, data: { value: String(value) } });
+        } else {
+          updated = await tx.config.create({ data: { key, value: String(value) } });
+        }
+        await emitConfigChanged(tx, actor, { action: 'config-param', key: updated.key, value: updated.value });
+        return updated;
+      });
+      res.json({ param });
+    } catch (err) { next(err); }
+  });
+
+  // ---- Ticket 13: Admin — chuyển khối, kho sự kiện viewer, entered-in-error, metric giám sát ----
+
+  // Chuyển khối: preview + confirm chuyển N ticket từ phòng nguồn sang phòng đích
+  app.post('/api/admin/bulk-transfer/preview', requireRole('ADMIN'), async (req, res, next) => {
+    const { sourceRoomId, targetRoomId } = req.body ?? {};
+    if (!sourceRoomId || !targetRoomId) return res.status(400).json({ error: 'Thiếu sourceRoomId hoặc targetRoomId' });
+    if (sourceRoomId === targetRoomId) return res.status(400).json({ error: 'Phòng nguồn và đích không được trùng nhau' });
+    try {
+      const [sourceRoom, targetRoom] = await Promise.all([
+        prisma.room.findUnique({ where: { id: sourceRoomId } }),
+        prisma.room.findUnique({ where: { id: targetRoomId } }),
+      ]);
+      if (!sourceRoom || !targetRoom) return res.status(404).json({ error: 'Không tìm thấy phòng' });
+
+      // Chỉ chuyển ticket đang chờ (waiting/called/parked) có roomId = sourceRoomId
+      // Ticket chưa xếp phòng (roomId null) không trong scope chuyển khối
+      const tickets = await prisma.queueTicket.findMany({
+        where: { roomId: sourceRoomId, status: { in: ['waiting', 'called', 'parked'] } },
+        include: { patient: true },
+      });
+
+      // Kiểm tra sức chứa phòng đích
+      const activeInTarget = await prisma.queueTicket.count({
+        where: { roomId: targetRoomId, status: { in: ['waiting', 'called', 'parked', 'present'] } },
+      });
+      const willExceed = activeInTarget + tickets.length > targetRoom.capacity;
+
+      res.json({
+        sourceRoom: { id: sourceRoom.id, code: sourceRoom.code, name: sourceRoom.name },
+        targetRoom: { id: targetRoom.id, code: targetRoom.code, name: targetRoom.name },
+        tickets: tickets.map((t) => ({ id: t.id, number: t.number, patient: t.patient.fullName, status: t.status })),
+        count: tickets.length,
+        targetCapacity: targetRoom.capacity,
+        currentInTarget: activeInTarget,
+        willExceed,
+        previewOnly: true,
+      });
+    } catch (err) { next(err); }
+  });
+
+  app.post('/api/admin/bulk-transfer/execute', requireRole('ADMIN'), async (req, res, next) => {
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
+    const { sourceRoomId, targetRoomId, confirm } = req.body ?? {};
+    if (!confirm) return res.status(400).json({ error: 'Cần confirm=true để thực hiện' });
+    if (!sourceRoomId || !targetRoomId) return res.status(400).json({ error: 'Thiếu sourceRoomId hoặc targetRoomId' });
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        const [sourceRoom, targetRoom] = await Promise.all([
+          tx.room.findUnique({ where: { id: sourceRoomId } }),
+          tx.room.findUnique({ where: { id: targetRoomId } }),
+        ]);
+        if (!sourceRoom || !targetRoom) throw httpError(404, 'Không tìm thấy phòng');
+
+        const tickets = await tx.queueTicket.findMany({
+          where: { roomId: sourceRoomId, status: { in: ['waiting', 'called', 'parked'] } },
+        });
+
+        const activeInTarget = await tx.queueTicket.count({
+          where: { roomId: targetRoomId, status: { in: ['waiting', 'called', 'parked', 'present'] } },
+        });
+        if (activeInTarget + tickets.length > targetRoom.capacity) {
+          throw httpError(409, 'Phòng đích vượt sức chứa');
+        }
+
+        let moved = 0;
+        for (const ticket of tickets) {
+          const swapped = await tx.queueTicket.updateMany({
+            where: { id: ticket.id, roomId: sourceRoomId },
+            data: { roomId: targetRoomId },
+          });
+          if (swapped.count === 0) continue; // idempotent: đã chuyển rồi
+          await recordEvent(tx, {
+            type: 'queue.ticket.changed',
+            aggregateId: ticket.id,
+            payload: { ticketId: ticket.id, number: ticket.number, dateKey: ticket.dateKey, fromRoomId: sourceRoomId, toRoomId: targetRoomId, reason: 'bulk-transfer' },
+            actor,
+          });
+          moved++;
+        }
+
+        // Phòng nguồn chuyển disabled kèm lý do
+        await tx.room.update({ where: { id: sourceRoomId }, data: { state: 'disabled', disabledReason: `Chuyển khối ${moved} ticket sang ${targetRoom.code}` } });
+        await recordEvent(tx, {
+          type: 'room.state.changed',
+          aggregateId: sourceRoomId,
+          payload: { roomId: sourceRoomId, from: sourceRoom.state, to: 'disabled', reason: `bulk-transfer-out-${moved}` },
+          actor,
+        });
+
+        return { moved, tickets: tickets.map((t) => t.id) };
+      });
+      res.json(result);
+    } catch (err) { next(err); }
+  });
+
+  // Event viewer: lọc theo phòng/bệnh nhân/ngày/thao tác
+  app.get('/api/admin/events', requireRole('ADMIN'), async (req, res, next) => {
+    try {
+      const { roomId, patientId, dateFrom, dateTo, type, actorUserId, limit = '100', offset = '0' } = req.query;
+      const where = {};
+      if (roomId) where.payload = { contains: `"roomId":"${roomId}"` };
+      if (patientId) where.aggregateId = patientId;
+      if (type) where.type = type;
+      if (actorUserId) where.actorUserId = actorUserId;
+      if (dateFrom || dateTo) {
+        where.occurredAt = {};
+        if (dateFrom) where.occurredAt.gte = new Date(dateFrom);
+        if (dateTo) where.occurredAt.lte = new Date(dateTo);
+      }
+      const [events, total] = await Promise.all([
+        prisma.event.findMany({
+          where,
+          orderBy: { occurredAt: 'desc' },
+          take: parseInt(limit),
+          skip: parseInt(offset),
+        }),
+        prisma.event.count({ where }),
+      ]);
+      res.json({ events: events.map((e) => ({ ...e, payload: JSON.parse(e.payload) })), total });
+    } catch (err) { next(err); }
+  });
+
+  // Entered-in-error: đánh dấu Appointment/Visit nhập nhầm
+  app.post('/api/admin/mark-entered-in-error', requireRole('ADMIN'), async (req, res, next) => {
+    const actor = { type: 'user', id: req.session.user.id, label: req.session.user.displayName };
+    const { appointmentId, visitId, reason } = req.body ?? {};
+    if (!appointmentId && !visitId) return res.status(400).json({ error: 'Cần appointmentId hoặc visitId' });
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        let updated = {};
+        if (appointmentId) {
+          const appt = await tx.appointment.update({ where: { id: appointmentId }, data: { status: 'entered-in-error' } });
+          await recordEvent(tx, { type: 'appointment.entered-in-error', aggregateId: appt.id, payload: { appointmentId: appt.id, reason }, actor });
+          updated.appointment = appt;
+        }
+        if (visitId) {
+          const visit = await tx.visit.update({ where: { id: visitId }, data: { status: 'entered-in-error' } });
+          await recordEvent(tx, { type: 'visit.entered-in-error', aggregateId: visit.id, payload: { visitId: visit.id, reason }, actor });
+          updated.visit = visit;
+        }
+        return updated;
+      });
+      res.json(result);
+    } catch (err) { next(err); }
+  });
+
+  // Dashboard metrics: p50/p90 wait, priority change freq, override rate
+  app.get('/api/admin/metrics', requireRole('ADMIN'), async (req, res, next) => {
+    try {
+      const { dateFrom, dateTo } = req.query;
+      const from = dateFrom ? new Date(dateFrom) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+      const to = dateTo ? new Date(dateTo) : new Date();
+
+      // Wait time p50/p90 từ event queue.ticket.changed (waiting → called/present)
+      const waitEvents = await prisma.event.findMany({
+        where: { type: 'queue.ticket.changed', occurredAt: { gte: from, lte: to }, payload: { contains: 'waiting' } },
+      });
+      const waitTimes = waitEvents.map((e) => {
+        const p = JSON.parse(e.payload);
+        return p.waitMs || 0;
+      }).filter((w) => w > 0);
+      waitTimes.sort((a, b) => a - b);
+      const p50 = waitTimes.length ? waitTimes[Math.floor(waitTimes.length * 0.5)] : 0;
+      const p90 = waitTimes.length ? waitTimes[Math.floor(waitTimes.length * 0.9)] : 0;
+
+      // Priority change frequency
+      const priorityEvents = await prisma.event.count({ where: { type: 'queue.ticket.changed', occurredAt: { gte: from, lte: to }, payload: { contains: 'priority' } } });
+
+      // Override rate
+      const overrideEvents = await prisma.event.count({ where: { type: 'queue.ticket.changed', occurredAt: { gte: from, lte: to }, payload: { contains: 'override' } } });
+      const totalTickets = await prisma.queueTicket.count({ where: { issuedAt: { gte: from, lte: to } } });
+      const overrideRate = totalTickets ? (overrideEvents / totalTickets) * 100 : 0;
+
+      // Alerts: p90 wait > 30 min, override rate > 10%
+      const alerts = [];
+      if (p90 > 30 * 60 * 1000) alerts.push({ level: 'warning', message: `p90 thời gian chờ ${Math.round(p90 / 60000)} phút vượt ngưỡng 30 phút` });
+      if (overrideRate > 10) alerts.push({ level: 'warning', message: `Tỷ lệ override ${overrideRate.toFixed(1)}% vượt ngưỡng 10%` });
+
+      res.json({
+        waitTime: { p50, p90, unit: 'ms', p50Min: Math.round(p50 / 60000), p90Min: Math.round(p90 / 60000) },
+        priorityChanges: priorityEvents,
+        overrideRate: Number(overrideRate.toFixed(2)),
+        totalTicketsInPeriod: totalTickets,
+        alerts,
+        period: { from: from.toISOString(), to: to.toISOString() },
+      });
+    } catch (err) { next(err); }
+  });
+
   // Lỗi nghiệp vụ mang status (httpError) — trả JSON thay vì trang HTML 500 mặc định của Express.
   app.use((err, req, res, next) => {
     if (err.status) {
@@ -1092,6 +1771,7 @@ export function createApp({ vite = null, distDir = null } = {}) {
   app.get('/tv', sendIndex);
   app.get('/book', sendIndex);
   app.get('/track', sendIndex);
+  app.get('/doctor', sendIndex);
 
   return app;
 }

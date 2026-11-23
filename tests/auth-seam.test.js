@@ -8,6 +8,7 @@ import { io } from 'socket.io-client';
 
 process.env.DATABASE_URL = 'file:./prisma/test.db';
 process.env.NODE_ENV = 'test';
+process.env.PRISMA_PROVIDER = 'sqlite';
 
 let prisma;
 let server;

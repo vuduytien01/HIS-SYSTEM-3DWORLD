@@ -1,0 +1,196 @@
+// Prisma schema — ticket 01: User + Session.
+// Dev local: SQLite (file:./dev.db). Deploy (ticket 14): đổi provider thành postgres + DATABASE_URL Postgres.
+// Test dùng SQLite qua env DATABASE_URL + PRISMA_PROVIDER=sqlite (schema phải dùng provider literal).
+// Called by: docker-compose.yml (prisma migrate deploy), seed.js (prisma client), server/db.js (prisma client)
+// No existing file serves this purpose - this is the backup copy
+// Data schemas: All domain models (User, Session, Patient, Appointment, QueueTicket, Room, Visit, VisitLocation, Config, Event)
+// User instruction: "LƯU TOÀN BỘ KẾT QUẢ,ĐÁNH GIÁ,BÁO CÁO, TOÀN BỘ IMPORTANT THING VÀO CHỖ AN TOÀN ĐỂ DỌN %TEMP%"
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String    @id @default(cuid())
+  username     String    @unique
+  passwordHash String
+  // RECEPTIONIST | DOCTOR | ADMIN
+  role         String
+  displayName  String
+  active       Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  sessions     Session[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  // SHA-256 của token cookie; token gốc chỉ sống trong cookie httpOnly
+  tokenHash String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+// Từ vựng FHIR R5 giữ nguyên tiếng Anh gốc (story 39). Giá trị có dấu gạch (checked-in, no-show,
+// tên sự kiện) không enum được trong Prisma — các trường đó giữ String và được siết ở ranh giới API.
+enum Gender {
+  male
+  female
+  other
+  unknown
+}
+
+enum AppointmentChannel {
+  online
+  desk
+}
+
+// Ticket 02: hồ sơ bệnh nhân. searchName = tên gấp về không dấu chữ thường cho tìm kiếm tiếng Việt.
+model Patient {
+  id              String        @id @default(cuid())
+  fullName        String
+  searchName      String        @default("") // gấp về không dấu chữ thường; records cũ giữ rỗng, chỉ khớp nguyên văn
+  dob             DateTime
+  gender          Gender
+  nationalId      String?       @unique
+  medicalRecordNo String?       @unique
+  insuranceNo     String?
+  phone           String
+  createdAt       DateTime      @default(now())
+  appointments    Appointment[]
+  queueTickets    QueueTicket[]
+  visits          Visit[]
+}
+
+// Kế hoạch hẹn — vòng đời FHIR R5 giản lược: booked → checked-in (ticket 02), các nhánh sau của ticket 05+.
+model Appointment {
+  id              String             @id @default(cuid())
+  patientId       String
+  patient         Patient            @relation(fields: [patientId], references: [id])
+  status          String // proposed|pending|booked|arrived|checked-in|fulfilled|cancelled|noshow|entered-in-error
+  scheduledFor    DateTime
+  channel         AppointmentChannel // online: đặt từ kênh web; desk: walk-in tại quầy
+  checkedInAt     DateTime?
+  createdByUserId String?
+  createdAt       DateTime           @default(now())
+  queueTickets    QueueTicket[]
+
+  @@index([patientId, scheduledFor])
+  @@index([status, scheduledFor])
+}
+
+// Thẻ hàng đợi hạng nhất — STT cấp theo ngày, reset mỗi sáng (dateKey).
+model QueueTicket {
+  id            String    @id @default(cuid())
+  patientId     String
+  patient       Patient   @relation(fields: [patientId], references: [id])
+  appointmentId String?
+  appointment   Appointment? @relation(fields: [appointmentId], references: [id])
+  dateKey       String // YYYY-MM-DD theo giờ server
+  number        Int
+  // 8 ký tự hex in trên phiếu STT — bệnh nhân theo dõi kênh web bằng mã, không cần tài khoản
+  trackingCode  String    @unique
+  // waiting|called|present|parked|skipped|no-show
+  status        String    @default("waiting")
+  callAttempts  Int       @default(0)
+  parkedUntil   DateTime?
+  presenceAt    DateTime?
+  skippedAt     DateTime?
+  // Trật tự hàng chờ thật: đặt khi phát số, cập nhật khi rejoin — người quay lại vào cuối hàng nhưng giữ số gốc
+  lastQueuedAt  DateTime  @default(now())
+  issuedAt      DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  // Ticket 07: nhóm ưu tiên (QĐ 1313) + ActPriority (emergency|urgent|asap|routine)
+  priority      String    @default("routine")
+  // groupId cho đoàn bệnh nhân (khám sức khỏe hợp đồng)
+  groupId       String?
+
+  @@unique([dateKey, number])
+  @@index([dateKey, status])
+  @@index([patientId])
+  @@index([groupId])
+  visit Visit?
+}
+
+// Tham số vận hành — key-value đọc qua getConfigParam; màn chỉnh của admin vào ticket 12.
+model Config {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+// Phòng — mã bất biến, tên hiển thị đổi được (ticket 12). Khu thu ngân là một Phòng (kind CASHIER).
+model Room {
+  id             String   @id @default(cuid())
+  code           String   @unique
+  name           String
+  // CONSULT | ANCILLARY | CASHIER
+  kind           String
+  // free | reserved | occupied | cleaning | disabled | alert
+  state          String   @default("free")
+  disabledReason String?
+  reopenAt       DateTime?
+  capacity       Int      @default(1)
+  prefix         String?
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  visits         Visit[]
+  locations      VisitLocation[]
+}
+
+// Lượt khám (đối ứng Encounter) — planned → in-progress → ... (ticket 10 nút xong khám, ticket 11 cashier)
+model Visit {
+  id        String          @id @default(cuid())
+  ticketId  String          @unique
+  ticket    QueueTicket     @relation(fields: [ticketId], references: [id])
+  patientId String
+  patient   Patient         @relation(fields: [patientId], references: [id])
+  // planned | in-progress | on-hold | discharged | completed | cancelled | discontinued | entered-in-error | unknown
+  status    String          @default("planned")
+  roomId    String?
+  room      Room?           @relation(fields: [roomId], references: [id])
+  locations VisitLocation[]
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  @@index([roomId, status])
+  @@index([patientId])
+}
+
+// Encounter.location append-only: mỗi entry planned → active → completed; đổi nơi gói một transaction.
+model VisitLocation {
+  id        String   @id @default(cuid())
+  visitId   String
+  visit     Visit    @relation(fields: [visitId], references: [id], onDelete: Cascade)
+  roomId    String
+  room      Room     @relation(fields: [roomId], references: [id])
+  // planned | active | completed | reserved
+  status    String   @default("planned")
+  startedAt DateTime @default(now())
+  endedAt   DateTime?
+
+  @@index([visitId, status])
+}
+
+// Kho sự kiện append-only — timestamp server, chỉ ghi thêm. 7 nhóm theo spec.
+model Event {
+  id          String   @id @default(cuid())
+  type        String
+  aggregateId String // patientId / ticketId tuỳ type
+  payload     String // JSON của SQLite: stringify khi ghi
+  actorType   String // user|patient-web|system
+  actorUserId String?
+  actorLabel  String
+  occurredAt  DateTime @default(now())
+
+  @@index([type, occurredAt])
+  @@index([aggregateId, occurredAt])
+}

@@ -6,6 +6,8 @@ const DEFAULTS = {
   maxRecalls: 2,
   undoWindowMs: 60 * 1000,
   noShowGraceMs: 15 * 60 * 1000,
+  forgotThresholdMultiplier: 1.5,
+  forgotThresholdMinMs: 15 * 60 * 1000,
 };
 
 // Danh sách lý do override cấu hình được (admin chỉnh ticket 12).

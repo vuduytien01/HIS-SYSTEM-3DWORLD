@@ -1,0 +1,47 @@
+# Deploy story (ticket 14): Postgres cho production + app service.
+# Dev local trên máy không có Docker dùng SQLite qua DATABASE_URL="file:dev.db".
+# Process: docker-compose reads this file to start Postgres + App services.
+# Effect: Starts production database and application with healthchecks.
+# No secrets in plain text - POSTGRES_PASSWORD and DEMO_PASSWORD read from .env at runtime.
+# User instruction: "LƯU TOÀN BỘ KẾT QUẢ,ĐÁNH GIÁ,BÁO CÁO, TOÀN BỘ IMPORTANT THING VÀO CHỖ AN TOÀN ĐỂ DỌN %TEMP%"
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: hospital
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?điền qua .env}
+      POSTGRES_DB: hospital
+    ports:
+      - "5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hospital -d hospital"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: "postgresql://hospital:${POSTGRES_PASSWORD:?điền qua .env}@db:5432/hospital?schema=public"
+      PORT: "3000"
+      NODE_ENV: "production"
+      COOKIE_SECURE: "false"
+      DEMO_PASSWORD: ${DEMO_PASSWORD:?điền qua .env}
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      sh -c "
+        npx prisma migrate deploy &&
+        node prisma/seed.js &&
+        node server/index.js
+      "
+
+volumes:
+  db-data:

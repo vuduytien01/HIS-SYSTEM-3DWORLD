@@ -6,6 +6,8 @@ import { renderWorkspace } from './pages/workspace.js';
 import { renderTv } from './pages/tv.js';
 import { renderBook } from './pages/book.js';
 import { renderTrack } from './pages/track.js';
+import { renderDoctor } from './pages/doctor.js';
+import { renderAdmin } from './pages/admin.js';
 
 export async function boot() {
   const root = document.getElementById('app');
@@ -22,6 +24,16 @@ export async function boot() {
 
   if (location.pathname === '/track') {
     renderTrack(root);
+    return;
+  }
+
+  if (location.pathname === '/doctor') {
+    renderDoctor(root);
+    return;
+  }
+
+  if (location.pathname === '/admin') {
+    renderAdmin(root);
     return;
   }
 

@@ -6,6 +6,7 @@ import {
   apiUndoTicket, apiOverrideComplete, apiOverrideReasons,
   apiSetPriority, apiEmergencyLane, apiGroupAdmission,
   apiDragDropAssign,
+  apiCashierPending, apiCashierPayment, apiCashierEndOfDaySweep,
 } from '../api.js';
 import { HospitalWorld } from '../world/world.js';
 import { ROLE_LABELS } from '../roles.js';
@@ -116,6 +117,17 @@ export function renderReception(root, user) {
         <div class="world-controls" style="margin-top:8px">
           <button id="world-reload" class="primary">Tải lại world</button>
           <span class="muted" id="world-status">Đang tải...</span>
+        </div>
+      </section>
+      <section class="panel cashier-panel">
+        <h2>Khu thu ngân — bệnh nhân chờ thanh toán</h2>
+        <table class="list">
+          <thead><tr><th>STT</th><th>Bệnh nhân</th><th>Phòng khám</th><th>Xong khám lúc</th><th>Thao tác</th></tr></thead>
+          <tbody id="cashier-tbody"></tbody>
+        </table>
+        <div style="margin-top:8px;display:flex;gap:8px">
+          <button id="cashier-refresh" class="primary">Làm mới</button>
+          <button id="cashier-sweep" class="primary" style="background:#b91c1c">Sweep cuối ngày (in-progress treo → discharged + autoClosed)</button>
         </div>
       </section>
     </main>
@@ -573,4 +585,57 @@ export function renderReception(root, user) {
   // Client gửi POST /api/tickets/:id/drag-drop, server trả accept/reject
   // world sẽ lắng nghe drag.reject / drag.accept
   console.log('3D World drag-drop ready');
+
+  // ---- Khu thu ngân ----
+  async function refreshCashier() {
+    try {
+      const { visits } = await apiCashierPending();
+      $('#cashier-tbody').innerHTML = visits.length
+        ? visits.map((v) => {
+            const p = v.ticket?.patient;
+            const completedAt = v.updatedAt ? timeOf(v.updatedAt) : '--:--';
+            return `<tr>
+              <td>${esc(v.ticket?.number ?? '--')}</td>
+              <td>${esc(p?.fullName ?? '--')}</td>
+              <td>${esc(v.room?.name ?? '--')}</td>
+              <td>${esc(completedAt)}</td>
+              <td><button class="primary" data-pay="${esc(v.id)}">Đóng tiền → completed</button></td>
+            </tr>`;
+          }).join('')
+        : '<tr><td colspan="5" class="muted">Không có bệnh nhân chờ thanh toán.</td></tr>';
+
+      $('#cashier-tbody').querySelectorAll('button[data-pay]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const visitId = btn.dataset.pay;
+          try {
+            const res = await apiCashierPayment(visitId);
+            toast(`Đã đóng tiền cho STT ${res.visit?.ticket?.number ?? visitId}`);
+            await refreshCashier();
+          } catch (err) {
+            alert(err.message);
+          }
+        });
+      });
+    } catch (err) {
+      console.error('refreshCashier error:', err);
+    }
+  }
+
+  $('#cashier-refresh').addEventListener('click', refreshCashier);
+  $('#cashier-sweep').addEventListener('click', async () => {
+    if (!confirm('Sweep cuối ngày: chuyển TẤT CẢ in-progress treo (>4h không cập nhật) → discharged + autoClosed. Không bao giờ tự completed. Tiếp tục?')) return;
+    try {
+      const res = await apiCashierEndOfDaySweep();
+      toast(`Sweep cuối ngày: ${res.swept} lượt autoClosed`);
+      await refreshCashier();
+      await refreshLists();
+    } catch (err) {
+      alert(err.message);
+    }
+  });
+
+  // Khởi tạo refresh cashier
+  refreshCashier();
+  // Auto-refresh mỗi 30 giây
+  setInterval(refreshCashier, 30000);
 }

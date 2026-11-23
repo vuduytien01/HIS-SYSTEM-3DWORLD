@@ -82,6 +82,52 @@ export const apiDragDropAssign = (ticketId, roomId, callNow = false) =>
     body: JSON.stringify({ roomId, callNow }),
   });
 
+// ---- Ticket 10: Doctor thin console ----
+export const apiDoctorVisits = () => fetchJson('/api/doctor/visits');
+export const apiDoctorCompleteAndCallNext = (visitId, roomId, callNow = true) =>
+  fetchJson('/api/doctor/complete-and-call-next', { method: 'POST', body: JSON.stringify({ visitId, roomId, callNow }) });
+export const apiDoctorException = (visitId, type, roomId) =>
+  fetchJson('/api/doctor/exception', { method: 'POST', body: JSON.stringify({ visitId, type, roomId }) });
+export const apiDoctorForgotten = () => fetchJson('/api/doctor/forgotten');
+
+// ---- Ticket 11: Khu thu ngân ----
+export const apiCashierPending = () => fetchJson('/api/cashier/pending');
+export const apiCashierPayment = (visitId) =>
+  fetchJson('/api/cashier/payment', { method: 'POST', body: JSON.stringify({ visitId }) });
+export const apiCashierEndOfDaySweep = () =>
+  fetchJson('/api/cashier/end-of-day-sweep', { method: 'POST' });
+
+// ---- Ticket 12: Admin cấu hình phòng + tham số ----
+export const apiAdminRooms = () => fetchJson('/api/admin/rooms');
+export const apiAdminCreateRoom = (data) =>
+  fetchJson('/api/admin/rooms', { method: 'POST', body: JSON.stringify(data) });
+export const apiAdminUpdateRoom = (id, data) =>
+  fetchJson(`/api/admin/rooms/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(data) });
+export const apiRoomStateChange = (id, data) =>
+  fetchJson(`/api/rooms/${encodeURIComponent(id)}/state`, { method: 'PATCH', body: JSON.stringify(data) });
+export const apiAdminConfigParams = () => fetchJson('/api/admin/config-params');
+export const apiAdminSetConfigParam = (key, value) =>
+  fetchJson('/api/admin/config-params', { method: 'POST', body: JSON.stringify({ key, value }) });
+
+// ---- Ticket 13: Admin bulk transfer, events viewer, entered-in-error, metrics ----
+export const apiAdminBulkTransferPreview = (sourceRoomId, targetRoomId) =>
+  fetchJson('/api/admin/bulk-transfer/preview', { method: 'POST', body: JSON.stringify({ sourceRoomId, targetRoomId }) });
+export const apiAdminBulkTransferExecute = (sourceRoomId, targetRoomId, confirm = true) =>
+  fetchJson('/api/admin/bulk-transfer/execute', { method: 'POST', body: JSON.stringify({ sourceRoomId, targetRoomId, confirm }) });
+export const apiAdminEvents = (params = {}) => {
+  const qs = new URLSearchParams(params).toString();
+  return fetchJson(`/api/admin/events${qs ? '?' + qs : ''}`);
+};
+export const apiAdminMarkEnteredInError = (appointmentId, visitId, reason) =>
+  fetchJson('/api/admin/mark-entered-in-error', { method: 'POST', body: JSON.stringify({ appointmentId, visitId, reason }) });
+export const apiAdminMetrics = (dateFrom, dateTo) => {
+  const params = {};
+  if (dateFrom) params.dateFrom = dateFrom;
+  if (dateTo) params.dateTo = dateTo;
+  const qs = new URLSearchParams(params).toString();
+  return fetchJson(`/api/admin/metrics${qs ? '?' + qs : ''}`);
+};
+
 export function connectSocket(options = {}) {
   return io({ withCredentials: true, ...options });
 }

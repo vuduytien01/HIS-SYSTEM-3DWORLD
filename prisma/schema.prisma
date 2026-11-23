@@ -1,5 +1,6 @@
 // Prisma schema — ticket 01: User + Session.
 // Dev local: SQLite (file:./dev.db). Deploy (ticket 14): đổi provider thành postgres + DATABASE_URL Postgres.
+// Test dùng SQLite qua env DATABASE_URL + PRISMA_PROVIDER=sqlite (schema phải dùng provider literal).
 generator client {
   provider = "prisma-client-js"
 }

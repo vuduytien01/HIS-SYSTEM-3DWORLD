@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { dateKeyOf } from '../server/queue.js';
 
 process.env.DATABASE_URL = 'file:./test-queue.db';
+process.env.PRISMA_PROVIDER = 'sqlite';
 
 let server;
 let prisma;
